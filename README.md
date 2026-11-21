@@ -70,3 +70,9 @@ target/release/rust_archiver.exe
 build_release.bat
 ```
 Все готовые артефакты будут помещены в папку `dist/`.
+
+---
+
+## Лицензия
+
+Проект распространяется под открытой лицензией [MIT](LICENSE).
