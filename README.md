@@ -42,7 +42,7 @@
 
 ## Скачивание и установка
 
-Готовые сборки и официальный установщик (`RustArch_Setup_v0.4.0.exe`) доступны на странице [Releases](../../releases).
+Готовые сборки и официальный установщик (`RustArch_Setup_v0.4.0.exe`) доступны на странице [Releases](https://github.com/qpwqp069-sys/RustArch/releases).
 
 ---
 
