@@ -31,6 +31,9 @@ use zip::CompressionMethod;
 static GLOBAL: MiMalloc = MiMalloc;
 
 const APP_ICON_BYTES: &[u8] = include_bytes!("../app_icon.ico");
+const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const GITHUB_LATEST_API: &str =
+    "https://api.github.com/repos/qpwqp069-sys/RustArch/releases/latest";
 const CANCELLED_MARKER: &str = "__RUSTARCH_CANCELLED__";
 const ZIP64_THRESHOLD_BYTES: u64 = 3_800_000_000;
 const ZIP_PARALLEL_MAX_FILE_SIZE: u64 = 32 * 1024 * 1024;
@@ -45,8 +48,8 @@ fn main() -> eframe::Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("RustArch — Быстрый архиватор")
-        .with_inner_size([750.0_f32, 695.0_f32])
-        .with_min_inner_size([620.0_f32, 580.0_f32])
+        .with_inner_size([760.0_f32, 725.0_f32])
+        .with_min_inner_size([630.0_f32, 600.0_f32])
         .with_drag_and_drop(true);
 
     if let Some(icon) = load_embedded_icon() {
@@ -78,6 +81,412 @@ fn load_embedded_icon() -> Option<IconData> {
         height: image.height(),
     })
 }
+
+fn total_cpu_threads() -> usize {
+    thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(1)
+}
+
+fn build_thread_pool(threads: usize) -> Result<rayon::ThreadPool, String> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads.max(1))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+// ---------- Системные вызовы Windows (звук, обновление иконок, URL) ----------
+
+#[cfg(windows)]
+mod win_native {
+    use std::ffi::c_void;
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
+    pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBeep(u_type: u32) -> i32;
+    }
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHChangeNotify(
+            w_event_id: i32,
+            u_flags: u32,
+            dw_item1: *const c_void,
+            dw_item2: *const c_void,
+        );
+    }
+
+    pub fn play_done_sound() {
+        unsafe {
+            MessageBeep(0x0000_0040); // MB_ICONASTERISK
+        }
+    }
+
+    pub fn notify_shell_assoc_changed() {
+        const SHCNE_ASSOCCHANGED: i32 = 0x0800_0000;
+        const SHCNF_IDLIST: u32 = 0x0000;
+        unsafe {
+            SHChangeNotify(
+                SHCNE_ASSOCCHANGED,
+                SHCNF_IDLIST,
+                std::ptr::null(),
+                std::ptr::null(),
+            );
+        }
+    }
+
+    pub fn open_url(url: &str) {
+        let _ = Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+}
+
+#[cfg(not(windows))]
+mod win_native {
+    pub fn play_done_sound() {}
+    pub fn notify_shell_assoc_changed() {}
+    pub fn open_url(_url: &str) {}
+}
+
+// ---------- Интеграция с Windows: контекстное меню ПКМ и ассоциации файлов ----------
+
+#[cfg(windows)]
+mod win_shell {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+    use winreg::RegKey;
+
+    const MENU_KEYS: [&str; 2] = [
+        r"Software\Classes\*\shell\RustArch",
+        r"Software\Classes\Directory\shell\RustArch",
+    ];
+    const PROGID: &str = "RustArch.Archive";
+    const PROGID_KEY: &str = r"Software\Classes\RustArch.Archive";
+    const MAIN_EXTS: [&str; 5] = [".001", ".xz", ".zst", ".br", ".lz4"];
+
+    pub fn is_installed_version() -> bool {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("unins000.exe").exists()))
+            .unwrap_or(false)
+    }
+
+    pub fn is_context_menu_enabled() -> bool {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        hkcu.open_subkey_with_flags(MENU_KEYS[0], KEY_READ).is_ok()
+    }
+
+    pub fn context_menu_needs_update() -> bool {
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
+        let expected = format!("\"{}\" \"%1\"", exe.display());
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let cmd_key = format!(r"{}\command", MENU_KEYS[0]);
+        let Ok(key) = hkcu.open_subkey_with_flags(cmd_key, KEY_READ) else {
+            return false;
+        };
+        let current: String = key.get_value("").unwrap_or_default();
+        !current.eq_ignore_ascii_case(&expected)
+    }
+
+    pub fn set_context_menu_enabled(enable: bool) -> Result<(), String> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        if enable {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let exe_str = exe.display().to_string();
+            let icon_val = format!("\"{exe_str}\",0");
+            let cmd_val = format!("\"{exe_str}\" \"%1\"");
+
+            for base in MENU_KEYS {
+                let (key, _) = hkcu.create_subkey(base).map_err(|e| e.to_string())?;
+                key.set_value("", &"Открыть в RustArch")
+                    .map_err(|e| e.to_string())?;
+                key.set_value("Icon", &icon_val)
+                    .map_err(|e| e.to_string())?;
+
+                let (cmd_key, _) = key.create_subkey("command").map_err(|e| e.to_string())?;
+                cmd_key
+                    .set_value("", &cmd_val)
+                    .map_err(|e| e.to_string())?;
+            }
+        } else {
+            for base in MENU_KEYS {
+                let _ = hkcu.delete_subkey_all(base);
+            }
+        }
+        Ok(())
+    }
+
+    fn is_ext_associated(ext: &str) -> bool {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let path = format!(r"Software\Classes\{ext}");
+        let Ok(key) = hkcu.open_subkey_with_flags(path, KEY_READ) else {
+            return false;
+        };
+        let val: String = key.get_value("").unwrap_or_default();
+        val == PROGID
+    }
+
+    pub fn is_assoc_main_enabled() -> bool {
+        MAIN_EXTS.iter().all(|ext| is_ext_associated(ext))
+    }
+
+    pub fn is_assoc_7z_enabled() -> bool {
+        is_ext_associated(".7z")
+    }
+
+    pub fn assoc_needs_update() -> bool {
+        if !is_assoc_main_enabled() && !is_assoc_7z_enabled() {
+            return false;
+        }
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
+        let expected = format!("\"{}\" \"%1\"", exe.display());
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let cmd_key = format!(r"{PROGID_KEY}\shell\open\command");
+        let Ok(key) = hkcu.open_subkey_with_flags(cmd_key, KEY_READ) else {
+            return true;
+        };
+        let current: String = key.get_value("").unwrap_or_default();
+        !current.eq_ignore_ascii_case(&expected)
+    }
+
+    fn ensure_progid() -> Result<(), String> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe_str = exe.display().to_string();
+        let icon_val = format!("\"{exe_str}\",0");
+        let cmd_val = format!("\"{exe_str}\" \"%1\"");
+
+        let (prog_key, _) = hkcu.create_subkey(PROGID_KEY).map_err(|e| e.to_string())?;
+        prog_key
+            .set_value("", &"Архив RustArch")
+            .map_err(|e| e.to_string())?;
+
+        let (icon_key, _) = prog_key
+            .create_subkey("DefaultIcon")
+            .map_err(|e| e.to_string())?;
+        icon_key
+            .set_value("", &icon_val)
+            .map_err(|e| e.to_string())?;
+
+        let (cmd_key, _) = prog_key
+            .create_subkey(r"shell\open\command")
+            .map_err(|e| e.to_string())?;
+        cmd_key
+            .set_value("", &cmd_val)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn set_exts_enabled(exts: &[&str], enable: bool) -> Result<(), String> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        if enable {
+            ensure_progid()?;
+            for ext in exts {
+                let path = format!(r"Software\Classes\{ext}");
+                let (key, _) = hkcu.create_subkey(path).map_err(|e| e.to_string())?;
+                key.set_value("", &PROGID).map_err(|e| e.to_string())?;
+            }
+        } else {
+            for ext in exts {
+                if is_ext_associated(ext) {
+                    let path = format!(r"Software\Classes\{ext}");
+                    let _ = hkcu.delete_subkey_all(path);
+                }
+            }
+            if !is_assoc_main_enabled() && !is_assoc_7z_enabled() {
+                let _ = hkcu.delete_subkey_all(PROGID_KEY);
+            }
+        }
+        super::win_native::notify_shell_assoc_changed();
+        Ok(())
+    }
+
+    pub fn set_assoc_main(enable: bool) -> Result<(), String> {
+        set_exts_enabled(&MAIN_EXTS, enable)
+    }
+
+    pub fn set_assoc_7z(enable: bool) -> Result<(), String> {
+        set_exts_enabled(&[".7z"], enable)
+    }
+
+    pub fn refresh_progid_path() -> Result<(), String> {
+        ensure_progid()?;
+        super::win_native::notify_shell_assoc_changed();
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+mod win_shell {
+    pub fn is_installed_version() -> bool {
+        false
+    }
+    pub fn is_context_menu_enabled() -> bool {
+        false
+    }
+    pub fn context_menu_needs_update() -> bool {
+        false
+    }
+    pub fn set_context_menu_enabled(_enable: bool) -> Result<(), String> {
+        Err("Доступно только в Windows.".to_string())
+    }
+    pub fn is_assoc_main_enabled() -> bool {
+        false
+    }
+    pub fn is_assoc_7z_enabled() -> bool {
+        false
+    }
+    pub fn assoc_needs_update() -> bool {
+        false
+    }
+    pub fn set_assoc_main(_enable: bool) -> Result<(), String> {
+        Err("Доступно только в Windows.".to_string())
+    }
+    pub fn set_assoc_7z(_enable: bool) -> Result<(), String> {
+        Err("Доступно только в Windows.".to_string())
+    }
+    pub fn refresh_progid_path() -> Result<(), String> {
+        Ok(())
+    }
+}
+
+// ---------- Проверка и скачивание обновлений с GitHub Releases ----------
+
+#[derive(Clone)]
+struct ReleaseInfo {
+    tag: String,
+    html_url: String,
+    setup_download_url: Option<String>,
+}
+
+enum UpdateEvent {
+    CheckFinished {
+        manual: bool,
+        result: Result<Option<ReleaseInfo>, String>,
+    },
+    DownloadFinished(Result<PathBuf, String>),
+}
+
+#[derive(Deserialize)]
+struct GitHubReleaseDto {
+    tag_name: String,
+    html_url: String,
+    #[serde(default)]
+    assets: Vec<GitHubAssetDto>,
+}
+
+#[derive(Deserialize)]
+struct GitHubAssetDto {
+    name: String,
+    browser_download_url: String,
+}
+
+fn parse_semver(raw: &str) -> (u32, u32, u32) {
+    let clean = raw.trim().trim_start_matches(['v', 'V']);
+    let mut parts = clean.split('.').map(|part| {
+        let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse::<u32>().unwrap_or(0)
+    });
+    let major = parts.next().unwrap_or(0);
+    let minor = parts.next().unwrap_or(0);
+    let patch = parts.next().unwrap_or(0);
+    (major, minor, patch)
+}
+
+fn fetch_latest_release() -> Result<Option<ReleaseInfo>, String> {
+    let mut cmd = Command::new("curl.exe");
+    cmd.args([
+        "-sSL",
+        "--fail",
+        "--max-time",
+        "8",
+        "-H",
+        "User-Agent: RustArch",
+        "-H",
+        "Accept: application/vnd.github+json",
+        GITHUB_LATEST_API,
+    ]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(win_native::CREATE_NO_WINDOW);
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Не удалось запустить curl.exe: {e}"))?;
+    if !output.status.success() {
+        return Err("Не удалось подключиться к GitHub (проверь интернет).".to_string());
+    }
+
+    let dto: GitHubReleaseDto = serde_json::from_slice(&output.stdout)
+        .map_err(|_| "Некорректный ответ от GitHub API.".to_string())?;
+
+    if parse_semver(&dto.tag_name) > parse_semver(CURRENT_VERSION) {
+        let setup_download_url = dto
+            .assets
+            .iter()
+            .find(|a| {
+                let lower = a.name.to_ascii_lowercase();
+                lower.contains("setup") && lower.ends_with(".exe")
+            })
+            .map(|a| a.browser_download_url.clone());
+
+        Ok(Some(ReleaseInfo {
+            tag: dto.tag_name,
+            html_url: dto.html_url,
+            setup_download_url,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+fn download_installer_exe(url: &str, tag: &str) -> Result<PathBuf, String> {
+    let clean_tag = sanitize_name(tag);
+    let dest = std::env::temp_dir().join(format!("RustArch_Setup_{clean_tag}.exe"));
+    let _ = fs::remove_file(&dest);
+
+    let mut cmd = Command::new("curl.exe");
+    cmd.args([
+        "-sSL",
+        "--fail",
+        "--max-time",
+        "120",
+        "-H",
+        "User-Agent: RustArch",
+        "-o",
+    ]);
+    cmd.arg(&dest);
+    cmd.arg(url);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(win_native::CREATE_NO_WINDOW);
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Не удалось запустить загрузку: {e}"))?;
+    if !output.status.success() || !dest.exists() {
+        return Err("Ошибка при скачивании установщика с GitHub.".to_string());
+    }
+
+    Ok(dest)
+}
+
+// ---------- Модели конфигурации и UI ----------
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum ThemeMode {
@@ -204,6 +613,14 @@ impl CompressionLevel {
         }
     }
 
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Fast => "Отвечает за степень сжатия: минимальная плотность — упакует быстрее, но файл весит больше.",
+            Self::Balanced => "Отвечает за степень сжатия: золотая середина между минимальным весом и временем упаковки.",
+            Self::Maximum => "Отвечает за степень сжатия: максимальная плотность — минимальный вес архива, но жмёт дольше.",
+        }
+    }
+
     fn zip_level(self) -> i64 {
         match self {
             Self::Fast => 1,
@@ -262,9 +679,13 @@ struct AppConfig {
     default_format: ArchiveFormat,
     default_level: CompressionLevel,
     custom_split_mb: u64,
+    /// 0 = Авто (все доступные потоки CPU), 1..=N = заданный лимит потоков
+    max_threads: usize,
     overwrite_existing: bool,
     auto_extract_without_confirm: bool,
     smart_skip_media_zip: bool,
+    notify_on_complete: bool,
+    check_updates_on_start: bool,
 }
 
 impl Default for AppConfig {
@@ -276,9 +697,12 @@ impl Default for AppConfig {
             default_format: ArchiveFormat::TarZst,
             default_level: CompressionLevel::Balanced,
             custom_split_mb: 25,
+            max_threads: 0,
             overwrite_existing: false,
             auto_extract_without_confirm: false,
             smart_skip_media_zip: true,
+            notify_on_complete: true,
+            check_updates_on_start: true,
         }
     }
 }
@@ -301,6 +725,10 @@ fn load_config() -> AppConfig {
     if cfg.custom_split_mb == 0 {
         cfg.custom_split_mb = 25;
     }
+    let total = total_cpu_threads();
+    if cfg.max_threads > total {
+        cfg.max_threads = 0;
+    }
     cfg
 }
 
@@ -318,79 +746,6 @@ fn save_config(cfg: &AppConfig) {
 
 fn downloads_dir() -> Option<PathBuf> {
     UserDirs::new().and_then(|u| u.download_dir().map(|p| p.to_path_buf()))
-}
-
-// ---------- Интеграция с контекстным меню Windows (HKCU, без прав админа) ----------
-
-#[cfg(windows)]
-mod win_shell {
-    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
-    use winreg::RegKey;
-
-    const KEYS: [&str; 2] = [
-        r"Software\Classes\*\shell\RustArch",
-        r"Software\Classes\Directory\shell\RustArch",
-    ];
-
-    pub fn is_enabled() -> bool {
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        hkcu.open_subkey_with_flags(KEYS[0], KEY_READ).is_ok()
-    }
-
-    pub fn needs_path_update() -> bool {
-        let Ok(exe) = std::env::current_exe() else {
-            return false;
-        };
-        let expected = format!("\"{}\" \"%1\"", exe.display());
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let cmd_key = format!(r"{}\command", KEYS[0]);
-        let Ok(key) = hkcu.open_subkey_with_flags(cmd_key, KEY_READ) else {
-            return false;
-        };
-        let current: String = key.get_value("").unwrap_or_default();
-        !current.eq_ignore_ascii_case(&expected)
-    }
-
-    pub fn set_enabled(enable: bool) -> Result<(), String> {
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        if enable {
-            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-            let exe_str = exe.display().to_string();
-            let icon_val = format!("\"{exe_str}\",0");
-            let cmd_val = format!("\"{exe_str}\" \"%1\"");
-
-            for base in KEYS {
-                let (key, _) = hkcu.create_subkey(base).map_err(|e| e.to_string())?;
-                key.set_value("", &"Открыть в RustArch")
-                    .map_err(|e| e.to_string())?;
-                key.set_value("Icon", &icon_val)
-                    .map_err(|e| e.to_string())?;
-
-                let (cmd_key, _) = key.create_subkey("command").map_err(|e| e.to_string())?;
-                cmd_key
-                    .set_value("", &cmd_val)
-                    .map_err(|e| e.to_string())?;
-            }
-        } else {
-            for base in KEYS {
-                let _ = hkcu.delete_subkey_all(base);
-            }
-        }
-        Ok(())
-    }
-}
-
-#[cfg(not(windows))]
-mod win_shell {
-    pub fn is_enabled() -> bool {
-        false
-    }
-    pub fn needs_path_update() -> bool {
-        false
-    }
-    pub fn set_enabled(_enable: bool) -> Result<(), String> {
-        Err("Контекстное меню доступно только в Windows.".to_string())
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -506,6 +861,7 @@ enum WorkerMessage {
         bytes_done: u64,
         total_bytes: u64,
         speed_mbps: f64,
+        eta_secs: Option<f64>,
         status: String,
     },
     Done {
@@ -532,6 +888,7 @@ struct PendingArchive {
 struct ArchiverApp {
     config: AppConfig,
     view: ActiveView,
+    total_cores: usize,
 
     inputs: Vec<PathBuf>,
     mode: AppMode,
@@ -543,16 +900,30 @@ struct ArchiverApp {
 
     pending_archive: Option<PendingArchive>,
 
+    // Интеграция с Windows
     context_menu_enabled: bool,
     context_menu_needs_update: bool,
-    context_menu_notice: Option<(String, bool)>,
+    assoc_main_enabled: bool,
+    assoc_7z_enabled: bool,
+    assoc_needs_update: bool,
+    shell_notice: Option<(String, bool)>,
 
+    // Обновления с GitHub
+    is_installed_app: bool,
+    update_rx: Option<Receiver<UpdateEvent>>,
+    update_checking: bool,
+    update_downloading: bool,
+    available_update: Option<ReleaseInfo>,
+    update_notice: Option<(String, bool)>,
+
+    // Выполнение задачи
     is_busy: bool,
     cancel_flag: Option<Arc<AtomicBool>>,
     progress: Option<f32>,
     bytes_done: u64,
     total_bytes: u64,
     speed_mbps: f64,
+    eta_secs: Option<f64>,
     status_text: String,
     is_error: bool,
     last_result_path: Option<PathBuf>,
@@ -565,8 +936,15 @@ impl ArchiverApp {
         let config = load_config();
         apply_theme(&cc.egui_ctx, config.theme);
 
-        let context_menu_enabled = win_shell::is_enabled();
-        let context_menu_needs_update = context_menu_enabled && win_shell::needs_path_update();
+        let context_menu_enabled = win_shell::is_context_menu_enabled();
+        let context_menu_needs_update =
+            context_menu_enabled && win_shell::context_menu_needs_update();
+        let assoc_main_enabled = win_shell::is_assoc_main_enabled();
+        let assoc_7z_enabled = win_shell::is_assoc_7z_enabled();
+        let assoc_needs_update = win_shell::assoc_needs_update();
+        let is_installed_app = win_shell::is_installed_version();
+
+        let check_on_start = config.check_updates_on_start;
 
         let mut app = Self {
             format: config.default_format,
@@ -574,6 +952,7 @@ impl ArchiverApp {
             custom_split_input: config.custom_split_mb.to_string(),
             config,
             view: ActiveView::Main,
+            total_cores: total_cpu_threads(),
             inputs: Vec::new(),
             mode: AppMode::Compress,
             split_preset: SplitPreset::None,
@@ -581,13 +960,23 @@ impl ArchiverApp {
             pending_archive: None,
             context_menu_enabled,
             context_menu_needs_update,
-            context_menu_notice: None,
+            assoc_main_enabled,
+            assoc_7z_enabled,
+            assoc_needs_update,
+            shell_notice: None,
+            is_installed_app,
+            update_rx: None,
+            update_checking: false,
+            update_downloading: false,
+            available_update: None,
+            update_notice: None,
             is_busy: false,
             cancel_flag: None,
             progress: None,
             bytes_done: 0,
             total_bytes: 0,
             speed_mbps: 0.0,
+            eta_secs: None,
             status_text: "Готов к работе. Перетащи файлы, папку или архив.".to_string(),
             is_error: false,
             last_result_path: None,
@@ -598,7 +987,149 @@ impl ArchiverApp {
             app.add_paths(initial_paths, true, &cc.egui_ctx);
         }
 
+        if check_on_start {
+            app.trigger_update_check(false, &cc.egui_ctx);
+        }
+
         app
+    }
+
+    fn effective_threads(&self) -> usize {
+        if self.config.max_threads == 0 {
+            self.total_cores
+        } else {
+            self.config.max_threads.clamp(1, self.total_cores)
+        }
+    }
+
+    fn refresh_shell_status(&mut self) {
+        self.context_menu_enabled = win_shell::is_context_menu_enabled();
+        self.context_menu_needs_update =
+            self.context_menu_enabled && win_shell::context_menu_needs_update();
+        self.assoc_main_enabled = win_shell::is_assoc_main_enabled();
+        self.assoc_7z_enabled = win_shell::is_assoc_7z_enabled();
+        self.assoc_needs_update = win_shell::assoc_needs_update();
+    }
+
+    fn trigger_update_check(&mut self, manual: bool, ctx: &egui::Context) {
+        if self.update_checking || self.update_downloading {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.update_rx = Some(rx);
+        self.update_checking = true;
+        if manual {
+            self.update_notice = Some(("Проверка обновлений на GitHub...".to_string(), false));
+        }
+
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || {
+            let result = fetch_latest_release();
+            let _ = tx.send(UpdateEvent::CheckFinished { manual, result });
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn trigger_update_install(&mut self, ctx: &egui::Context) {
+        let Some(info) = self.available_update.clone() else {
+            return;
+        };
+
+        // Если это установленная версия и на GitHub есть Setup.exe — скачиваем и запускаем поверх
+        if self.is_installed_app {
+            if let Some(url) = info.setup_download_url {
+                if self.update_downloading {
+                    return;
+                }
+                let (tx, rx) = mpsc::channel();
+                self.update_rx = Some(rx);
+                self.update_downloading = true;
+                self.update_notice = Some((
+                    format!("Скачиваю установщик {}...", info.tag),
+                    false,
+                ));
+                let tag = info.tag.clone();
+                let ctx_clone = ctx.clone();
+                thread::spawn(move || {
+                    let res = download_installer_exe(&url, &tag);
+                    let _ = tx.send(UpdateEvent::DownloadFinished(res));
+                    ctx_clone.request_repaint();
+                });
+                return;
+            }
+        }
+
+        // Для Portable-версии просто открываем страницу релиза в браузере
+        win_native::open_url(&info.html_url);
+    }
+
+    fn poll_updates(&mut self) {
+        let mut clear_rx = false;
+        if let Some(rx) = &self.update_rx {
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    UpdateEvent::CheckFinished { manual, result } => {
+                        self.update_checking = false;
+                        clear_rx = true;
+                        match result {
+                            Ok(Some(info)) => {
+                                let tag = info.tag.clone();
+                                self.available_update = Some(info);
+                                if manual {
+                                    self.update_notice = Some((
+                                        format!("Доступна новая версия {tag}!"),
+                                        false,
+                                    ));
+                                }
+                            }
+                            Ok(None) => {
+                                self.available_update = None;
+                                if manual {
+                                    self.update_notice = Some((
+                                        format!("У тебя актуальная версия (v{CURRENT_VERSION})."),
+                                        false,
+                                    ));
+                                }
+                            }
+                            Err(err) => {
+                                if manual {
+                                    self.update_notice = Some((err, true));
+                                }
+                            }
+                        }
+                    }
+                    UpdateEvent::DownloadFinished(result) => {
+                        self.update_downloading = false;
+                        clear_rx = true;
+                        match result {
+                            Ok(setup_path) => match Command::new(&setup_path).spawn() {
+                                Ok(_) => {
+                                    self.update_notice = Some((
+                                        "Установщик запущен — обновление заменит текущую версию."
+                                            .to_string(),
+                                        false,
+                                    ));
+                                    self.status_text =
+                                        "Запущен установщик новой версии RustArch.".to_string();
+                                }
+                                Err(err) => {
+                                    self.update_notice = Some((
+                                        format!("Скачано, но не удалось запустить: {err}"),
+                                        true,
+                                    ));
+                                }
+                            },
+                            Err(err) => {
+                                self.update_notice = Some((err, true));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if clear_rx {
+            self.update_rx = None;
+        }
     }
 
     fn split_limit_bytes(&self) -> Option<u64> {
@@ -639,8 +1170,6 @@ impl ArchiverApp {
             return;
         }
 
-        // Проверяем: либо бросили 1 архив (обычный или часть .001/.002),
-        // либо выделили и бросили сразу все части одного многотомного архива.
         let single_archive_candidate = if paths.len() == 1 {
             Some(paths[0].clone())
         } else if all_belong_to_same_split_archive(&paths) {
@@ -829,6 +1358,7 @@ impl ArchiverApp {
         self.bytes_done = 0;
         self.total_bytes = 0;
         self.speed_mbps = 0.0;
+        self.eta_secs = None;
         self.last_result_path = None;
         self.status_text = "Подготовка...".to_string();
 
@@ -838,6 +1368,7 @@ impl ArchiverApp {
         let level = self.level;
         let split_bytes = self.split_limit_bytes();
         let smart_skip = self.config.smart_skip_media_zip;
+        let threads = self.effective_threads();
         let ctx_clone = ctx.clone();
 
         thread::spawn(move || {
@@ -850,6 +1381,7 @@ impl ArchiverApp {
                     level,
                     split_bytes,
                     smart_skip,
+                    threads,
                     Arc::clone(&cancel_flag),
                     tx.clone(),
                     ctx_clone.clone(),
@@ -858,6 +1390,7 @@ impl ArchiverApp {
                     &inputs,
                     &target,
                     format,
+                    threads,
                     Arc::clone(&cancel_flag),
                     tx.clone(),
                     ctx_clone.clone(),
@@ -890,8 +1423,9 @@ impl ArchiverApp {
         });
     }
 
-    fn poll_worker(&mut self) {
+    fn poll_worker(&mut self, ctx: &egui::Context) {
         let mut finished = false;
+        let mut notify_done = false;
         if let Some(rx) = &self.rx {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
@@ -900,12 +1434,14 @@ impl ArchiverApp {
                         bytes_done,
                         total_bytes,
                         speed_mbps,
+                        eta_secs,
                         status,
                     } => {
                         self.progress = fraction.map(|f| f.clamp(0.0_f32, 1.0_f32));
                         self.bytes_done = bytes_done;
                         self.total_bytes = total_bytes;
                         self.speed_mbps = speed_mbps;
+                        self.eta_secs = eta_secs;
                         self.status_text = status;
                     }
                     WorkerMessage::Done {
@@ -915,14 +1451,17 @@ impl ArchiverApp {
                         self.is_busy = false;
                         self.is_error = false;
                         self.progress = None;
+                        self.eta_secs = None;
                         self.status_text = summary;
                         self.last_result_path = Some(result_path);
                         finished = true;
+                        notify_done = true;
                     }
                     WorkerMessage::Cancelled => {
                         self.is_busy = false;
                         self.is_error = false;
                         self.progress = None;
+                        self.eta_secs = None;
                         self.status_text = "Операция отменена пользователем.".to_string();
                         finished = true;
                     }
@@ -930,6 +1469,7 @@ impl ArchiverApp {
                         self.is_busy = false;
                         self.is_error = true;
                         self.progress = None;
+                        self.eta_secs = None;
                         self.status_text = format!("Ошибка: {err}");
                         finished = true;
                     }
@@ -940,9 +1480,15 @@ impl ArchiverApp {
             self.rx = None;
             self.cancel_flag = None;
         }
+        if notify_done && self.config.notify_on_complete {
+            win_native::play_done_sound();
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                egui::UserAttentionType::Informational,
+            ));
+        }
     }
 
-    fn render_top_bar(&mut self, ui: &mut egui::Ui, p: Palette) {
+    fn render_top_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, p: Palette) {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("RustArch")
@@ -951,20 +1497,22 @@ impl ArchiverApp {
                     .color(p.text_primary),
             );
             ui.label(
-                RichText::new("v4 Turbo")
+                RichText::new(format!("v{CURRENT_VERSION}"))
                     .size(12.0_f32)
                     .strong()
                     .color(p.accent),
             );
-            ui.add_space(8.0_f32);
-            let cores = thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1);
-            ui.label(
-                RichText::new(format!("Потоков CPU: {cores}  •  mimalloc + zlib-rs"))
-                    .size(12.0_f32)
-                    .color(p.text_muted),
-            );
+            ui.add_space(6.0_f32);
+            let active_threads = self.effective_threads();
+            let thread_text = if self.config.max_threads == 0 {
+                format!("Потоков CPU: {}  •  mimalloc + zlib-rs", self.total_cores)
+            } else {
+                format!(
+                    "Потоков CPU: {}/{}  •  mimalloc + zlib-rs",
+                    active_threads, self.total_cores
+                )
+            };
+            ui.label(RichText::new(thread_text).size(12.0_f32).color(p.text_muted));
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (btn_text, next_view) = match self.view {
@@ -978,11 +1526,36 @@ impl ArchiverApp {
 
                 if ui.add_enabled(!self.is_busy, btn).clicked() {
                     if next_view == ActiveView::Settings {
-                        self.context_menu_enabled = win_shell::is_enabled();
-                        self.context_menu_needs_update =
-                            self.context_menu_enabled && win_shell::needs_path_update();
+                        self.refresh_shell_status();
                     }
                     self.view = next_view;
+                }
+
+                if let Some(info) = self.available_update.clone() {
+                    let upd_label = if self.update_downloading {
+                        "Скачивание...".to_string()
+                    } else if self.is_installed_app && info.setup_download_url.is_some() {
+                        format!("Обновить до {}", info.tag)
+                    } else {
+                        format!("Доступна {}", info.tag)
+                    };
+
+                    let upd_btn = egui::Button::new(
+                        RichText::new(upd_label)
+                            .size(12.5_f32)
+                            .strong()
+                            .color(Color32::WHITE),
+                    )
+                    .fill(p.accent)
+                    .min_size(Vec2::new(126.0_f32, 30.0_f32))
+                    .rounding(Rounding::same(6.0_f32));
+
+                    if ui
+                        .add_enabled(!self.is_busy && !self.update_downloading, upd_btn)
+                        .clicked()
+                    {
+                        self.trigger_update_install(ctx);
+                    }
                 }
             });
         });
@@ -1092,68 +1665,181 @@ impl ArchiverApp {
                 });
             });
 
-            // Интеграция с Windows (Реестр ПКМ)
+            // Производительность и потоки CPU
             card_frame(p).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
-                    RichText::new("Интеграция с Windows (правая кнопка мыши)")
+                    RichText::new("Потоки процессора (CPU)")
                         .strong()
                         .color(p.text_primary),
                 );
                 ui.add_space(4.0_f32);
 
-                let mut toggle = self.context_menu_enabled;
+                let mut auto_threads = self.config.max_threads == 0;
                 if ui
                     .checkbox(
-                        &mut toggle,
+                        &mut auto_threads,
+                        format!(
+                            "Авто — использовать все доступные потоки ({})",
+                            self.total_cores
+                        ),
+                    )
+                    .changed()
+                {
+                    if auto_threads {
+                        self.config.max_threads = 0;
+                    } else {
+                        self.config.max_threads = (self.total_cores / 2).max(1);
+                    }
+                    changed = true;
+                }
+
+                if !auto_threads {
+                    let mut val = self.config.max_threads.clamp(1, self.total_cores);
+                    ui.horizontal(|ui| {
+                        ui.label("Ограничение потоков:");
+                        if ui
+                            .add(egui::Slider::new(&mut val, 1..=self.total_cores))
+                            .changed()
+                        {
+                            self.config.max_threads = val;
+                            changed = true;
+                        }
+                        ui.label(
+                            RichText::new(format!("из {}", self.total_cores))
+                                .size(12.0_f32)
+                                .color(p.text_muted),
+                        );
+                    });
+                    ui.label(
+                        RichText::new(
+                            "Удобно, если хочешь сжимать тяжёлый архив в фоне и спокойно сидеть в браузере или игре без подвисаний.",
+                        )
+                        .size(11.5_f32)
+                        .color(p.text_muted),
+                    );
+                }
+            });
+
+            // Интеграция с Windows (ПКМ и ассоциации файлов)
+            card_frame(p).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new("Интеграция с Windows (ПКМ и двойной клик)")
+                        .strong()
+                        .color(p.text_primary),
+                );
+                ui.add_space(4.0_f32);
+
+                let mut toggle_menu = self.context_menu_enabled;
+                if ui
+                    .checkbox(
+                        &mut toggle_menu,
                         "Добавить «Открыть в RustArch» в меню правой кнопки мыши (файлы и папки)",
                     )
                     .changed()
                 {
-                    match win_shell::set_enabled(toggle) {
+                    match win_shell::set_context_menu_enabled(toggle_menu) {
                         Ok(()) => {
-                            self.context_menu_enabled = toggle;
+                            self.context_menu_enabled = toggle_menu;
                             self.context_menu_needs_update = false;
-                            let msg = if toggle {
+                            let msg = if toggle_menu {
                                 "Пункт «Открыть в RustArch» добавлен в меню ПКМ."
                             } else {
                                 "Пункт удалён из меню ПКМ."
                             };
-                            self.context_menu_notice = Some((msg.to_string(), false));
+                            self.shell_notice = Some((msg.to_string(), false));
                         }
                         Err(err) => {
-                            self.context_menu_notice =
+                            self.shell_notice =
                                 Some((format!("Не удалось обновить реестр: {err}"), true));
                         }
                     }
                 }
 
-                if self.context_menu_needs_update {
+                let mut toggle_assoc_main = self.assoc_main_enabled;
+                if ui
+                    .checkbox(
+                        &mut toggle_assoc_main,
+                        "Открывать двойным кликом: .001 (части Discord), .xz, .zst, .br, .lz4",
+                    )
+                    .changed()
+                {
+                    match win_shell::set_assoc_main(toggle_assoc_main) {
+                        Ok(()) => {
+                            self.assoc_main_enabled = toggle_assoc_main;
+                            self.assoc_needs_update = win_shell::assoc_needs_update();
+                            let msg = if toggle_assoc_main {
+                                "Ассоциации файлов (.001, .xz, .zst, .br, .lz4) включены."
+                            } else {
+                                "Ассоциации файлов сняты."
+                            };
+                            self.shell_notice = Some((msg.to_string(), false));
+                        }
+                        Err(err) => {
+                            self.shell_notice =
+                                Some((format!("Не удалось обновить ассоциации: {err}"), true));
+                        }
+                    }
+                }
+
+                let mut toggle_assoc_7z = self.assoc_7z_enabled;
+                if ui
+                    .checkbox(&mut toggle_assoc_7z, "Также открывать двойным кликом .7z")
+                    .changed()
+                {
+                    match win_shell::set_assoc_7z(toggle_assoc_7z) {
+                        Ok(()) => {
+                            self.assoc_7z_enabled = toggle_assoc_7z;
+                            self.assoc_needs_update = win_shell::assoc_needs_update();
+                            let msg = if toggle_assoc_7z {
+                                "Файлы .7z теперь открываются через RustArch."
+                            } else {
+                                "Ассоциация .7z снята."
+                            };
+                            self.shell_notice = Some((msg.to_string(), false));
+                        }
+                        Err(err) => {
+                            self.shell_notice =
+                                Some((format!("Не удалось обновить ассоциацию .7z: {err}"), true));
+                        }
+                    }
+                }
+
+                if self.context_menu_needs_update || self.assoc_needs_update {
                     ui.horizontal(|ui| {
                         ui.label(
                             RichText::new("Путь к RustArch.exe изменился с момента включения.")
                                 .size(12.0_f32)
                                 .color(p.accent),
                         );
-                        if ui.button("Обновить путь").clicked() {
-                            match win_shell::set_enabled(true) {
-                                Ok(()) => {
-                                    self.context_menu_needs_update = false;
-                                    self.context_menu_notice = Some((
-                                        "Путь в контекстном меню обновлён.".to_string(),
-                                        false,
-                                    ));
+                        if ui.button("Обновить пути").clicked() {
+                            let mut ok = true;
+                            if self.context_menu_needs_update {
+                                if let Err(e) = win_shell::set_context_menu_enabled(true) {
+                                    self.shell_notice = Some((format!("Ошибка ПКМ: {e}"), true));
+                                    ok = false;
                                 }
-                                Err(err) => {
-                                    self.context_menu_notice =
-                                        Some((format!("Ошибка обновления: {err}"), true));
+                            }
+                            if self.assoc_needs_update {
+                                if let Err(e) = win_shell::refresh_progid_path() {
+                                    self.shell_notice =
+                                        Some((format!("Ошибка ассоциаций: {e}"), true));
+                                    ok = false;
                                 }
+                            }
+                            if ok {
+                                self.refresh_shell_status();
+                                self.shell_notice = Some((
+                                    "Пути интеграции в реестре обновлены.".to_string(),
+                                    false,
+                                ));
                             }
                         }
                     });
                 }
 
-                if let Some((msg, is_err)) = &self.context_menu_notice {
+                if let Some((msg, is_err)) = &self.shell_notice {
                     ui.label(
                         RichText::new(msg)
                             .size(12.0_f32)
@@ -1163,18 +1849,18 @@ impl ArchiverApp {
 
                 ui.label(
                     RichText::new(
-                        "Пишется только в ветку текущего пользователя (HKCU) без прав администратора. В Windows 11 пункт доступен через Shift + ПКМ или «Показать дополнительные параметры».",
+                        "Все записи идут только в ветку текущего пользователя (HKCU) без прав администратора. В Windows 11 пункт ПКМ доступен через Shift + ПКМ или «Показать дополнительные параметры».",
                     )
                     .size(11.5_f32)
                     .color(p.text_muted),
                 );
             });
 
-            // Поведение и производительность
+            // Поведение и уведомления
             card_frame(p).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
-                    RichText::new("Поведение и производительность")
+                    RichText::new("Поведение и уведомления")
                         .strong()
                         .color(p.text_primary),
                 );
@@ -1183,7 +1869,7 @@ impl ArchiverApp {
                 if ui
                     .checkbox(
                         &mut self.config.auto_extract_without_confirm,
-                        "Распаковывать архив сразу при перетаскивании (без окна подтверждения)",
+                        "Распаковывать архив сразу при перетаскивании / двойном клике (без окна подтверждения)",
                     )
                     .changed()
                 {
@@ -1210,14 +1896,82 @@ impl ArchiverApp {
                     changed = true;
                 }
 
-                ui.add_space(4.0_f32);
-                ui.label(
-                    RichText::new(
-                        "Турбо-режим активен: аллокатор mimalloc V3, многопоточное сжатие ZIP/7Z/ZST/XZ/GZ, SIMD zlib-rs, сборка многотомных архивов (.001/.002) на лету и полная автономность без DLL.",
+                if ui
+                    .checkbox(
+                        &mut self.config.notify_on_complete,
+                        "Системный звук и подсветка на панели задач по завершении операции",
                     )
-                    .size(12.0_f32)
-                    .color(p.text_muted),
+                    .changed()
+                {
+                    changed = true;
+                }
+            });
+
+            // Обновления с GitHub
+            card_frame(p).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let kind_lbl = if self.is_installed_app {
+                    "Установленная версия"
+                } else {
+                    "Portable-версия"
+                };
+                ui.label(
+                    RichText::new(format!(
+                        "Обновления (GitHub Releases)  •  v{CURRENT_VERSION} ({kind_lbl})"
+                    ))
+                    .strong()
+                    .color(p.text_primary),
                 );
+                ui.add_space(4.0_f32);
+
+                if ui
+                    .checkbox(
+                        &mut self.config.check_updates_on_start,
+                        "Автоматически проверять обновления при запуске программы",
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
+
+                ui.horizontal(|ui| {
+                    let check_btn = egui::Button::new(if self.update_checking {
+                        "Проверка..."
+                    } else {
+                        "Проверить обновления"
+                    });
+                    if ui
+                        .add_enabled(!self.update_checking && !self.update_downloading, check_btn)
+                        .clicked()
+                    {
+                        self.trigger_update_check(true, ctx);
+                    }
+
+                    if let Some(info) = self.available_update.clone() {
+                        let action_lbl = if self.update_downloading {
+                            "Скачивание...".to_string()
+                        } else if self.is_installed_app && info.setup_download_url.is_some() {
+                            format!("Скачать и установить {}", info.tag)
+                        } else {
+                            format!("Открыть релиз {}", info.tag)
+                        };
+                        let btn = egui::Button::new(
+                            RichText::new(action_lbl).strong().color(Color32::WHITE),
+                        )
+                        .fill(p.accent);
+                        if ui.add_enabled(!self.update_downloading, btn).clicked() {
+                            self.trigger_update_install(ctx);
+                        }
+                    }
+                });
+
+                if let Some((msg, is_err)) = &self.update_notice {
+                    ui.label(
+                        RichText::new(msg)
+                            .size(12.0_f32)
+                            .color(if *is_err { p.error } else { p.success }),
+                    );
+                }
             });
 
             if let Some(cfg_path) = config_file_path() {
@@ -1251,10 +2005,10 @@ impl ArchiverApp {
         let drop_resp = Frame::default()
             .fill(drop_bg)
             .rounding(Rounding::same(10.0_f32))
-            .inner_margin(Margin::same(16.0_f32))
+            .inner_margin(Margin::same(15.0_f32))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.set_min_height(126.0_f32);
+                ui.set_min_height(120.0_f32);
 
                 ui.vertical_centered(|ui| {
                     ui.add_space(4.0_f32);
@@ -1277,7 +2031,7 @@ impl ArchiverApp {
                         .size(12.0_f32)
                         .color(p.text_muted),
                     );
-                    ui.add_space(12.0_f32);
+                    ui.add_space(11.0_f32);
 
                     ui.horizontal(|ui| {
                         let buttons_width = 330.0_f32;
@@ -1330,7 +2084,10 @@ impl ArchiverApp {
                     let mode_badge = match self.mode {
                         AppMode::Compress => format!("Режим: Упаковка ({})", self.inputs.len()),
                         AppMode::Extract if self.inputs.len() > 1 => {
-                            format!("Режим: Распаковка (многотомный • частей: {})", self.inputs.len())
+                            format!(
+                                "Режим: Распаковка (многотомный • частей: {})",
+                                self.inputs.len()
+                            )
                         }
                         AppMode::Extract => "Режим: Распаковка (1)".to_string(),
                     };
@@ -1357,7 +2114,7 @@ impl ArchiverApp {
 
                 let mut remove_idx: Option<usize> = None;
                 egui::ScrollArea::vertical()
-                    .max_height(88.0_f32)
+                    .max_height(84.0_f32)
                     .show(ui, |ui| {
                         for (idx, path) in self.inputs.iter().enumerate() {
                             ui.horizontal(|ui| {
@@ -1367,7 +2124,8 @@ impl ArchiverApp {
                                     .file_name()
                                     .map(|n| n.to_string_lossy().into_owned())
                                     .unwrap_or_else(|| path.display().to_string());
-                                ui.label(name).on_hover_text(path.display().to_string());
+                                ui.add(egui::Label::new(name).truncate())
+                                    .on_hover_text(path.display().to_string());
 
                                 if self.mode == AppMode::Compress {
                                     ui.with_layout(
@@ -1480,9 +2238,16 @@ impl ArchiverApp {
                             save_config(&self.config);
                         }
                     });
+
+                    // Пояснение: отвечает именно за степень сжатия, а не за число потоков
+                    ui.label(
+                        RichText::new(self.level.hint())
+                            .size(11.5_f32)
+                            .color(p.text_muted),
+                    );
                 }
 
-                // Split Archive — ровно между «Сжатие» и «Имя архива»
+                // Split Archive — между «Сжатие» и «Имя архива»
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Split Archive:").strong());
                     ui.add_enabled_ui(!self.is_busy, |ui| {
@@ -1559,7 +2324,10 @@ impl ArchiverApp {
                     None => "Папка сохранения: рядом с исходными файлами".to_string(),
                 },
             };
-            ui.label(RichText::new(dest_preview).size(12.0_f32).color(p.text_muted));
+            ui.add(
+                egui::Label::new(RichText::new(dest_preview).size(12.0_f32).color(p.text_muted))
+                    .truncate(),
+            );
         });
 
         // Кнопки действия
@@ -1625,39 +2393,46 @@ impl ArchiverApp {
             }
         });
 
-        // Прогресс-бар — только во время активной операции
+        // Двухстрочный прогресс-бар (имя файла больше никогда не перекрывает скорость и ETA)
         if self.is_busy {
             ui.add_space(4.0_f32);
             draw_slim_progress_bar(ui, self.progress, p);
 
-            ui.horizontal(|ui| {
-                ui.label(
+            // Строка 1: текущая операция и имя файла с аккуратной обрезкой
+            ui.add(
+                egui::Label::new(
                     RichText::new(&self.status_text)
                         .size(12.5_f32)
                         .color(p.text_primary),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let metrics = if self.total_bytes > 0 {
-                        let pct = self.progress.unwrap_or(0.0_f32) * 100.0_f32;
-                        format!(
-                            "{:.0}%  •  {} / {}  •  {:.1} МБ/с",
-                            pct,
-                            format_bytes(self.bytes_done),
-                            format_bytes(self.total_bytes),
-                            self.speed_mbps
-                        )
-                    } else if self.bytes_done > 0 {
-                        format!(
-                            "{}  •  {:.1} МБ/с",
-                            format_bytes(self.bytes_done),
-                            self.speed_mbps
-                        )
-                    } else {
-                        String::new()
-                    };
-                    ui.label(RichText::new(metrics).size(12.0_f32).color(p.text_muted));
-                });
-            });
+                )
+                .truncate(),
+            );
+
+            // Строка 2: проценты, байты, скорость в МБ/с и оставшееся время (ETA)
+            let metrics = if self.total_bytes > 0 {
+                let pct = self.progress.unwrap_or(0.0_f32) * 100.0_f32;
+                let eta_part = match self.eta_secs {
+                    Some(secs) => format!("  •  Осталось {}", format_eta(secs)),
+                    None => String::new(),
+                };
+                format!(
+                    "{:.0}%  •  {} / {}  •  {:.1} МБ/с{}",
+                    pct,
+                    format_bytes(self.bytes_done),
+                    format_bytes(self.total_bytes),
+                    self.speed_mbps,
+                    eta_part
+                )
+            } else if self.bytes_done > 0 {
+                format!(
+                    "{}  •  {:.1} МБ/с",
+                    format_bytes(self.bytes_done),
+                    self.speed_mbps
+                )
+            } else {
+                "Вычисление объёма и скорости...".to_string()
+            };
+            ui.label(RichText::new(metrics).size(12.0_f32).color(p.text_muted));
         } else {
             let status_color = if self.is_error {
                 p.error
@@ -1783,7 +2558,8 @@ impl ArchiverApp {
 
 impl eframe::App for ArchiverApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_worker();
+        self.poll_worker(ctx);
+        self.poll_updates();
 
         let p = Palette::for_theme(self.config.theme);
         let is_hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
@@ -1805,8 +2581,8 @@ impl eframe::App for ArchiverApp {
             .frame(Frame::default().fill(p.bg).inner_margin(Margin::same(16.0_f32)))
             .show(ctx, |ui| {
                 ui.add_enabled_ui(!modal_open, |ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(10.0_f32, 10.0_f32);
-                    self.render_top_bar(ui, p);
+                    ui.spacing_mut().item_spacing = Vec2::new(10.0_f32, 9.0_f32);
+                    self.render_top_bar(ui, ctx, p);
                     ui.add_space(2.0_f32);
 
                     match self.view {
@@ -2035,8 +2811,6 @@ struct VolumePart {
     len: u64,
 }
 
-/// Читает и поддерживает `Seek` поверх одного или нескольких томов (.001, .002, ...)
-/// как над единым файлом в памяти — без временных копий на диске.
 struct MultiVolumeReader {
     parts: Vec<VolumePart>,
     total_len: u64,
@@ -2215,7 +2989,7 @@ fn split_file_into_volumes(
     Ok((part_idx, volume_part_path(base_output, 1, 3)))
 }
 
-// ---------- Адаптивные буферы, трекер прогресса и отмена ----------
+// ---------- Адаптивные буферы, трекер прогресса (с ETA) и отмена ----------
 
 fn adaptive_buffer_size(file_size: u64) -> usize {
     if file_size >= 200 * 1024 * 1024 {
@@ -2350,6 +3124,17 @@ impl ProgressTracker {
         } else {
             None
         };
+        let eta_secs = if self.total_bytes > 0 && done > 0 && elapsed >= 0.4 {
+            let remaining = self.total_bytes.saturating_sub(done) as f64;
+            let bps = done as f64 / elapsed;
+            if bps > 1.0 {
+                Some(remaining / bps)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let status = self
             .label
             .lock()
@@ -2362,6 +3147,7 @@ impl ProgressTracker {
                 bytes_done: done,
                 total_bytes: self.total_bytes,
                 speed_mbps,
+                eta_secs,
                 status,
             });
         }
@@ -2414,7 +3200,7 @@ fn copy_with_progress<R: Read, W: Write>(
     Ok(())
 }
 
-// ---------- Многопоточный GZIP (RFC 1952, чистый Rust + zlib-rs + rayon) ----------
+// ---------- Многопоточный GZIP (RFC 1952, zlib-rs + управляемый пул потоков) ----------
 
 struct ParallelGzipWriter<W: Write> {
     inner: W,
@@ -2425,24 +3211,29 @@ struct ParallelGzipWriter<W: Write> {
     pending_chunks: Vec<Vec<u8>>,
     wrote_any: bool,
     cancel: Arc<AtomicBool>,
+    pool: Arc<rayon::ThreadPool>,
 }
 
 impl<W: Write> ParallelGzipWriter<W> {
-    fn new(inner: W, level: flate2::Compression, cancel: Arc<AtomicBool>) -> Self {
-        let threads = thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .clamp(2, 32);
+    fn new(
+        inner: W,
+        level: flate2::Compression,
+        threads: usize,
+        pool: Arc<rayon::ThreadPool>,
+        cancel: Arc<AtomicBool>,
+    ) -> Self {
+        let batch_limit = threads.clamp(1, 32);
         let chunk_size = 1024 * 1024;
         Self {
             inner,
             level,
             chunk_size,
-            batch_limit: threads,
+            batch_limit,
             current_chunk: Vec::with_capacity(chunk_size),
-            pending_chunks: Vec::with_capacity(threads),
+            pending_chunks: Vec::with_capacity(batch_limit),
             wrote_any: false,
             cancel,
+            pool,
         }
     }
 
@@ -2456,14 +3247,16 @@ impl<W: Write> ParallelGzipWriter<W> {
 
         let batch = std::mem::take(&mut self.pending_chunks);
         let level = self.level;
-        let compressed: io::Result<Vec<Vec<u8>>> = batch
-            .into_par_iter()
-            .map(|raw| {
-                let mut enc = GzEncoder::new(Vec::with_capacity(raw.len() / 2), level);
-                enc.write_all(&raw)?;
-                enc.finish()
-            })
-            .collect();
+        let compressed: io::Result<Vec<Vec<u8>>> = self.pool.install(|| {
+            batch
+                .into_par_iter()
+                .map(|raw| {
+                    let mut enc = GzEncoder::new(Vec::with_capacity(raw.len() / 2), level);
+                    enc.write_all(&raw)?;
+                    enc.finish()
+                })
+                .collect()
+        });
 
         for member in compressed? {
             self.inner.write_all(&member)?;
@@ -2527,15 +3320,18 @@ fn run_compress(
     level: CompressionLevel,
     split_bytes: Option<u64>,
     smart_skip_media_zip: bool,
+    threads: usize,
     cancel: Arc<AtomicBool>,
     tx: Sender<WorkerMessage>,
     ctx: egui::Context,
 ) -> Result<(String, PathBuf), String> {
+    let pool = Arc::new(build_thread_pool(threads)?);
+
     let scan_tracker = ProgressTracker::new(0, Arc::clone(&cancel), tx.clone(), ctx.clone());
     scan_tracker.set_label("Сканирование файлов...".to_string());
     scan_tracker.emit(true);
 
-    let entries = collect_entries(inputs, &cancel)?;
+    let entries = collect_entries(inputs, &pool, &cancel)?;
     if entries.is_empty() {
         return Err("Нет файлов для сжатия.".to_string());
     }
@@ -2550,16 +3346,28 @@ fn run_compress(
     };
 
     match format {
-        ArchiveFormat::Zip => {
-            compress_zip_parallel(&entries, &work_path, level, smart_skip_media_zip, &tracker)?
-        }
-        ArchiveFormat::SevenZ => compress_7z(&entries, &work_path, level, &tracker)?,
-        ArchiveFormat::TarZst => compress_tar_zst(&entries, &work_path, level, &tracker)?,
-        ArchiveFormat::TarXz => compress_tar_xz(&entries, &work_path, level, &tracker)?,
+        ArchiveFormat::Zip => compress_zip_parallel(
+            &entries,
+            &work_path,
+            level,
+            smart_skip_media_zip,
+            threads,
+            &pool,
+            &tracker,
+        )?,
+        ArchiveFormat::SevenZ => compress_7z(&entries, &work_path, level, threads, &tracker)?,
+        ArchiveFormat::TarZst => compress_tar_zst(&entries, &work_path, level, threads, &tracker)?,
+        ArchiveFormat::TarXz => compress_tar_xz(&entries, &work_path, level, threads, &tracker)?,
         ArchiveFormat::TarBr => compress_tar_br(&entries, &work_path, level, &tracker)?,
-        ArchiveFormat::TarGz => {
-            compress_tar_gz(&entries, &work_path, level, &tracker, Arc::clone(&cancel))?
-        }
+        ArchiveFormat::TarGz => compress_tar_gz(
+            &entries,
+            &work_path,
+            level,
+            threads,
+            Arc::clone(&pool),
+            &tracker,
+            Arc::clone(&cancel),
+        )?,
         ArchiveFormat::TarLz4 => compress_tar_lz4(&entries, &work_path, &tracker)?,
         ArchiveFormat::TarBz2 => {
             return Err("Формат .tar.bz2 поддерживается только для распаковки.".to_string());
@@ -2620,12 +3428,15 @@ fn run_extract(
     volumes: &[PathBuf],
     extract_dir: &Path,
     format: ArchiveFormat,
+    threads: usize,
     cancel: Arc<AtomicBool>,
     tx: Sender<WorkerMessage>,
     ctx: egui::Context,
 ) -> Result<String, String> {
+    let pool = build_thread_pool(threads)?;
+
     let res = match format {
-        ArchiveFormat::Zip => extract_zip_parallel(volumes, extract_dir, cancel, tx, ctx),
+        ArchiveFormat::Zip => extract_zip_parallel(volumes, extract_dir, &pool, cancel, tx, ctx),
         ArchiveFormat::SevenZ => extract_7z(volumes, extract_dir, cancel, tx, ctx),
         ArchiveFormat::TarZst
         | ArchiveFormat::TarXz
@@ -2647,60 +3458,66 @@ fn run_extract(
     }
 }
 
-fn collect_entries(inputs: &[PathBuf], cancel: &AtomicBool) -> Result<Vec<FileEntry>, String> {
-    let nested: Result<Vec<Vec<FileEntry>>, String> = inputs
-        .par_iter()
-        .map(|input| {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(CANCELLED_MARKER.to_string());
-            }
-            let mut local = Vec::new();
-            if input.is_file() {
-                let name = input
-                    .file_name()
-                    .ok_or_else(|| format!("Некорректное имя файла: {}", input.display()))?
-                    .to_string_lossy()
-                    .into_owned();
-                let size = fs::metadata(input).map(|m| m.len()).unwrap_or(0);
-                local.push(FileEntry {
-                    src_path: input.clone(),
-                    archive_path: name,
-                    is_dir: false,
-                    size,
-                });
-            } else if input.is_dir() {
-                let base = input.parent().unwrap_or(input);
-                for entry_res in WalkDir::new(input) {
-                    if cancel.load(Ordering::Relaxed) {
-                        return Err(CANCELLED_MARKER.to_string());
-                    }
-                    let entry = entry_res.map_err(|e| e.to_string())?;
-                    let path = entry.path();
-                    let rel = path
-                        .strip_prefix(base)
-                        .unwrap_or(path)
+fn collect_entries(
+    inputs: &[PathBuf],
+    pool: &rayon::ThreadPool,
+    cancel: &AtomicBool,
+) -> Result<Vec<FileEntry>, String> {
+    let nested: Result<Vec<Vec<FileEntry>>, String> = pool.install(|| {
+        inputs
+            .par_iter()
+            .map(|input| {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(CANCELLED_MARKER.to_string());
+                }
+                let mut local = Vec::new();
+                if input.is_file() {
+                    let name = input
+                        .file_name()
+                        .ok_or_else(|| format!("Некорректное имя файла: {}", input.display()))?
                         .to_string_lossy()
-                        .replace('\\', "/");
-                    if rel.is_empty() {
-                        continue;
-                    }
-                    let is_dir = entry.file_type().is_dir();
-                    let size = if is_dir {
-                        0
-                    } else {
-                        entry.metadata().map(|m| m.len()).unwrap_or(0)
-                    };
+                        .into_owned();
+                    let size = fs::metadata(input).map(|m| m.len()).unwrap_or(0);
                     local.push(FileEntry {
-                        src_path: path.to_path_buf(),
-                        archive_path: rel,
-                        is_dir,
+                        src_path: input.clone(),
+                        archive_path: name,
+                        is_dir: false,
                         size,
                     });
+                } else if input.is_dir() {
+                    let base = input.parent().unwrap_or(input);
+                    for entry_res in WalkDir::new(input) {
+                        if cancel.load(Ordering::Relaxed) {
+                            return Err(CANCELLED_MARKER.to_string());
+                        }
+                        let entry = entry_res.map_err(|e| e.to_string())?;
+                        let path = entry.path();
+                        let rel = path
+                            .strip_prefix(base)
+                            .unwrap_or(path)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        if rel.is_empty() {
+                            continue;
+                        }
+                        let is_dir = entry.file_type().is_dir();
+                        let size = if is_dir {
+                            0
+                        } else {
+                            entry.metadata().map(|m| m.len()).unwrap_or(0)
+                        };
+                        local.push(FileEntry {
+                            src_path: path.to_path_buf(),
+                            archive_path: rel,
+                            is_dir,
+                            size,
+                        });
+                    }
                 }
-            }
-            Ok(local)
-        })
-        .collect();
+                Ok(local)
+            })
+            .collect()
+    });
 
     Ok(nested?.into_iter().flatten().collect())
 }
@@ -2714,45 +3531,48 @@ fn flush_parallel_zip_batch(
     done_counter: &Arc<AtomicUsize>,
     total_items: usize,
     threads: usize,
+    pool: &rayon::ThreadPool,
     tracker: &Arc<ProgressTracker>,
 ) -> Result<(), String> {
     if batch.is_empty() {
         return Ok(());
     }
 
-    let compressed_entries: Result<Vec<Cursor<Vec<u8>>>, String> = batch
-        .par_iter()
-        .map(|item| {
-            if tracker.is_cancelled() {
-                return Err(CANCELLED_MARKER.to_string());
-            }
-            let opts = SimpleFileOptions::default()
-                .compression_method(CompressionMethod::Deflated)
-                .compression_level(Some(level.zip_level()))
-                .large_file(use_zip64_globally || item.size >= ZIP64_THRESHOLD_BYTES);
+    let compressed_entries: Result<Vec<Cursor<Vec<u8>>>, String> = pool.install(|| {
+        batch
+            .par_iter()
+            .map(|item| {
+                if tracker.is_cancelled() {
+                    return Err(CANCELLED_MARKER.to_string());
+                }
+                let opts = SimpleFileOptions::default()
+                    .compression_method(CompressionMethod::Deflated)
+                    .compression_level(Some(level.zip_level()))
+                    .large_file(use_zip64_globally || item.size >= ZIP64_THRESHOLD_BYTES);
 
-            let mut mini_writer = zip::ZipWriter::new(Cursor::new(Vec::with_capacity(
-                (item.size as usize / 2).clamp(1024, 4 * 1024 * 1024),
-            )));
-            mini_writer
-                .start_file(&item.archive_path, opts)
-                .map_err(|e| e.to_string())?;
+                let mut mini_writer = zip::ZipWriter::new(Cursor::new(Vec::with_capacity(
+                    (item.size as usize / 2).clamp(1024, 4 * 1024 * 1024),
+                )));
+                mini_writer
+                    .start_file(&item.archive_path, opts)
+                    .map_err(|e| e.to_string())?;
 
-            let mut f = File::open(&item.src_path).map_err(|e| e.to_string())?;
-            let buf_sz = adaptive_buffer_size(item.size);
-            copy_with_progress(&mut f, &mut mini_writer, buf_sz, tracker)?;
+                let mut f = File::open(&item.src_path).map_err(|e| e.to_string())?;
+                let buf_sz = adaptive_buffer_size(item.size);
+                copy_with_progress(&mut f, &mut mini_writer, buf_sz, tracker)?;
 
-            let mut cursor = mini_writer.finish().map_err(|e| e.to_string())?;
-            cursor.set_position(0);
+                let mut cursor = mini_writer.finish().map_err(|e| e.to_string())?;
+                cursor.set_position(0);
 
-            let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
-            tracker.set_label(format!(
-                "ZIP [{threads} потоков] ({done}/{total_items}): {}",
-                item.archive_path
-            ));
-            Ok(cursor)
-        })
-        .collect();
+                let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                tracker.set_label(format!(
+                    "ZIP [{threads} потоков] ({done}/{total_items}): {}",
+                    item.archive_path
+                ));
+                Ok(cursor)
+            })
+            .collect()
+    });
 
     batch.clear();
 
@@ -2773,15 +3593,14 @@ fn compress_zip_parallel(
     output_path: &Path,
     level: CompressionLevel,
     smart_skip_media: bool,
+    threads: usize,
+    pool: &rayon::ThreadPool,
     tracker: &Arc<ProgressTracker>,
 ) -> Result<(), String> {
     let out_file = File::create(output_path).map_err(|e| e.to_string())?;
     let buffered_out = BufWriter::with_capacity(4 * 1024 * 1024, out_file);
     let mut writer = zip::ZipWriter::new(buffered_out);
 
-    let threads = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
     let use_zip64_globally = tracker.total_bytes >= ZIP64_THRESHOLD_BYTES;
     let total_items = entries.len().max(1);
     let done_counter = Arc::new(AtomicUsize::new(0));
@@ -2826,6 +3645,7 @@ fn compress_zip_parallel(
                     &done_counter,
                     total_items,
                     threads,
+                    pool,
                     tracker,
                 )?;
                 batch_bytes = 0;
@@ -2839,6 +3659,7 @@ fn compress_zip_parallel(
                 &done_counter,
                 total_items,
                 threads,
+                pool,
                 tracker,
             )?;
             batch_bytes = 0;
@@ -2879,6 +3700,7 @@ fn compress_zip_parallel(
         &done_counter,
         total_items,
         threads,
+        pool,
         tracker,
     )?;
 
@@ -2891,13 +3713,12 @@ fn compress_7z(
     entries: &[FileEntry],
     output_path: &Path,
     level: CompressionLevel,
+    threads: usize,
     tracker: &Arc<ProgressTracker>,
 ) -> Result<(), String> {
     let mut writer = ArchiveWriter::create(output_path).map_err(|e| e.to_string())?;
-    let threads = thread::available_parallelism()
-        .map(|n| n.get() as u32)
-        .unwrap_or(4);
-    let lzma_opts = Lzma2Options::from_level_mt(level.sevenz_level(), threads, 16 * 1024 * 1024);
+    let threads_u32 = threads.max(1) as u32;
+    let lzma_opts = Lzma2Options::from_level_mt(level.sevenz_level(), threads_u32, 16 * 1024 * 1024);
     writer.set_content_methods(vec![lzma_opts.into()]);
 
     let total_items = entries.len().max(1);
@@ -2910,7 +3731,7 @@ fn compress_7z(
             continue;
         }
         tracker.set_label(format!(
-            "7Z [{threads} потоков] ({}/{total_items}): {}",
+            "7Z [{threads_u32} потоков] ({}/{total_items}): {}",
             idx + 1,
             item.archive_path
         ));
@@ -2982,6 +3803,7 @@ fn compress_tar_zst(
     entries: &[FileEntry],
     output_path: &Path,
     level: CompressionLevel,
+    threads: usize,
     tracker: &Arc<ProgressTracker>,
 ) -> Result<(), String> {
     let out_file = File::create(output_path).map_err(|e| e.to_string())?;
@@ -2989,13 +3811,11 @@ fn compress_tar_zst(
     let mut encoder = zstd::stream::write::Encoder::new(buffered_out, level.zstd_level())
         .map_err(|e| e.to_string())?;
 
-    let threads = thread::available_parallelism()
-        .map(|n| n.get() as u32)
-        .unwrap_or(4);
-    encoder.multithread(threads).map_err(|e| e.to_string())?;
+    let threads_u32 = threads.max(1) as u32;
+    encoder.multithread(threads_u32).map_err(|e| e.to_string())?;
 
     let mut tar_builder = tar::Builder::new(encoder);
-    let tag = format!("TAR.ZST [{threads} потоков]");
+    let tag = format!("TAR.ZST [{threads_u32} потоков]");
     append_entries_to_tar(&mut tar_builder, entries, output_path, &tag, tracker)?;
 
     let encoder = tar_builder.into_inner().map_err(|e| e.to_string())?;
@@ -3008,21 +3828,20 @@ fn compress_tar_xz(
     entries: &[FileEntry],
     output_path: &Path,
     level: CompressionLevel,
+    threads: usize,
     tracker: &Arc<ProgressTracker>,
 ) -> Result<(), String> {
     let out_file = File::create(output_path).map_err(|e| e.to_string())?;
     let buffered_out = BufWriter::with_capacity(2 * 1024 * 1024, out_file);
 
-    let threads = thread::available_parallelism()
-        .map(|n| n.get() as u32)
-        .unwrap_or(4);
+    let threads_u32 = threads.max(1) as u32;
     let mut opts = lzma_rust2::XzOptions::with_preset(level.xz_level());
     opts.set_block_size(NonZeroU64::new(16 * 1024 * 1024));
     let encoder =
-        lzma_rust2::XzWriterMt::new(buffered_out, opts, threads).map_err(|e| e.to_string())?;
+        lzma_rust2::XzWriterMt::new(buffered_out, opts, threads_u32).map_err(|e| e.to_string())?;
 
     let mut tar_builder = tar::Builder::new(encoder);
-    let tag = format!("TAR.XZ [{threads} потоков]");
+    let tag = format!("TAR.XZ [{threads_u32} потоков]");
     append_entries_to_tar(&mut tar_builder, entries, output_path, &tag, tracker)?;
 
     let encoder = tar_builder.into_inner().map_err(|e| e.to_string())?;
@@ -3055,6 +3874,8 @@ fn compress_tar_gz(
     entries: &[FileEntry],
     output_path: &Path,
     level: CompressionLevel,
+    threads: usize,
+    pool: Arc<rayon::ThreadPool>,
     tracker: &Arc<ProgressTracker>,
     cancel: Arc<AtomicBool>,
 ) -> Result<(), String> {
@@ -3063,12 +3884,11 @@ fn compress_tar_gz(
     let gz = ParallelGzipWriter::new(
         buffered_out,
         flate2::Compression::new(level.gzip_level()),
+        threads,
+        pool,
         cancel,
     );
 
-    let threads = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
     let mut tar_builder = tar::Builder::new(gz);
     let tag = format!("TAR.GZ [{threads} потоков]");
     append_entries_to_tar(&mut tar_builder, entries, output_path, &tag, tracker)?;
@@ -3100,6 +3920,7 @@ fn compress_tar_lz4(
 fn extract_zip_parallel(
     volumes: &[PathBuf],
     extract_dir: &Path,
+    pool: &rayon::ThreadPool,
     cancel: Arc<AtomicBool>,
     tx: Sender<WorkerMessage>,
     ctx: egui::Context,
@@ -3133,35 +3954,37 @@ fn extract_zip_parallel(
     let total_files = file_indices.len().max(1);
     let done_files = Arc::new(AtomicUsize::new(0));
 
-    file_indices.par_iter().try_for_each_init(
-        || -> Result<zip::ZipArchive<MultiVolumeReader>, String> {
-            let r = MultiVolumeReader::open(volumes).map_err(|e| e.to_string())?;
-            zip::ZipArchive::new(r).map_err(|e| e.to_string())
-        },
-        |archive_res, &idx| -> Result<(), String> {
-            if tracker.is_cancelled() {
-                return Err(CANCELLED_MARKER.to_string());
-            }
-            let archive = archive_res.as_mut().map_err(|e| e.clone())?;
-            let mut entry = archive.by_index(idx).map_err(|e| e.to_string())?;
-            let Some(enclosed) = entry.enclosed_name() else {
-                return Ok(());
-            };
-            let completed = done_files.fetch_add(1, Ordering::Relaxed) + 1;
-            tracker.set_label(format!(
-                "Распаковка ZIP ({completed}/{total_files}): {}",
-                entry.name()
-            ));
+    pool.install(|| {
+        file_indices.par_iter().try_for_each_init(
+            || -> Result<zip::ZipArchive<MultiVolumeReader>, String> {
+                let r = MultiVolumeReader::open(volumes).map_err(|e| e.to_string())?;
+                zip::ZipArchive::new(r).map_err(|e| e.to_string())
+            },
+            |archive_res, &idx| -> Result<(), String> {
+                if tracker.is_cancelled() {
+                    return Err(CANCELLED_MARKER.to_string());
+                }
+                let archive = archive_res.as_mut().map_err(|e| e.clone())?;
+                let mut entry = archive.by_index(idx).map_err(|e| e.to_string())?;
+                let Some(enclosed) = entry.enclosed_name() else {
+                    return Ok(());
+                };
+                let completed = done_files.fetch_add(1, Ordering::Relaxed) + 1;
+                tracker.set_label(format!(
+                    "Распаковка ZIP ({completed}/{total_files}): {}",
+                    entry.name()
+                ));
 
-            let out_path = extract_dir.join(enclosed);
-            let out_file = File::create(&out_path).map_err(|e| e.to_string())?;
-            let buf_sz = adaptive_buffer_size(entry.size());
-            let mut out_writer = BufWriter::with_capacity(buf_sz, out_file);
-            copy_with_progress(&mut entry, &mut out_writer, buf_sz, &tracker)?;
-            out_writer.flush().map_err(|e| e.to_string())?;
-            Ok(())
-        },
-    )?;
+                let out_path = extract_dir.join(enclosed);
+                let out_file = File::create(&out_path).map_err(|e| e.to_string())?;
+                let buf_sz = adaptive_buffer_size(entry.size());
+                let mut out_writer = BufWriter::with_capacity(buf_sz, out_file);
+                copy_with_progress(&mut entry, &mut out_writer, buf_sz, &tracker)?;
+                out_writer.flush().map_err(|e| e.to_string())?;
+                Ok(())
+            },
+        )
+    })?;
 
     Ok(())
 }
@@ -3366,6 +4189,24 @@ fn format_bytes(bytes: u64) -> String {
         format!("{bytes} Б")
     } else {
         format!("{size:.2} {}", UNITS[unit_idx])
+    }
+}
+
+fn format_eta(secs: f64) -> String {
+    if secs < 1.0 {
+        "< 1 с".to_string()
+    } else if secs < 60.0 {
+        format!("~{:.0} с", secs)
+    } else if secs < 3600.0 {
+        let total = secs.round() as u64;
+        let m = total / 60;
+        let s = total % 60;
+        format!("~{m} м {s:02} с")
+    } else {
+        let total = secs.round() as u64;
+        let h = total / 3600;
+        let m = (total % 3600) / 60;
+        format!("~{h} ч {m:02} м")
     }
 }
 
