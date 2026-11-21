@@ -1,0 +1,36 @@
+[package]
+name = "rust_archiver"
+version = "0.4.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.30"
+rfd = "0.15"
+zip = { version = "2.2", default-features = false, features = ["deflate", "time"] }
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs", "runtime_detection"] }
+sevenz-rust2 = { version = "0.25", features = ["compress", "util"] }
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "encoder", "xz", "optimization"] }
+brotli = "9.1"
+bzip2 = "0.6"
+tar = "0.4"
+zstd = { version = "0.13", features = ["zstdmt"] }
+lz4_flex = "0.11"
+walkdir = "2.5"
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+directories = "5.0"
+ico = "0.6"
+rustfs-mimalloc = { version = "0.7.4", features = ["no_profile"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
