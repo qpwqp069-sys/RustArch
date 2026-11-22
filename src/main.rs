@@ -519,7 +519,7 @@ enum ArchiveFormat {
     TarBr,
     TarGz,
     TarLz4,
-    TarBz2, // Только распаковка
+    TarBz2, // Только распаковка и проверка
 }
 
 impl ArchiveFormat {
@@ -563,7 +563,7 @@ impl ArchiveFormat {
             Self::TarBr => "Алгоритм Brotli от Google — лучше всех сжимает исходный код, тексты, конфиги, JSON и веб-проекты.",
             Self::TarGz => "Классика для Linux, macOS и серверов — многопоточное сжатие на быстром движке zlib-rs.",
             Self::TarLz4 => "Рекордная скорость SSD — мгновенная упаковка огромных папок, когда время важнее веса.",
-            Self::TarBz2 => "Устаревший формат Bzip2 — поддерживается для распаковки готовых архивов из сети.",
+            Self::TarBz2 => "Устаревший формат Bzip2 — поддерживается для распаковки и проверки готовых архивов из сети.",
         }
     }
 
@@ -683,6 +683,8 @@ struct AppConfig {
     max_threads: usize,
     overwrite_existing: bool,
     auto_extract_without_confirm: bool,
+    delete_source_after_extract: bool,
+    verify_integrity_enabled: bool,
     smart_skip_media_zip: bool,
     notify_on_complete: bool,
     check_updates_on_start: bool,
@@ -700,6 +702,8 @@ impl Default for AppConfig {
             max_threads: 0,
             overwrite_existing: false,
             auto_extract_without_confirm: false,
+            delete_source_after_extract: false,
+            verify_integrity_enabled: false,
             smart_skip_media_zip: true,
             notify_on_complete: true,
             check_updates_on_start: true,
@@ -847,12 +851,25 @@ fn apply_theme(ctx: &egui::Context, theme: ThemeMode) {
 enum AppMode {
     Compress,
     Extract,
+    Verify,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ActiveView {
     Main,
     Settings,
+}
+
+#[derive(Clone)]
+struct VerifyReport {
+    title: String,
+    headline: String,
+    archive_name: String,
+    format_label: String,
+    parts_count: usize,
+    entries_count: usize,
+    checked_bytes: u64,
+    elapsed_secs: f64,
 }
 
 enum WorkerMessage {
@@ -866,7 +883,9 @@ enum WorkerMessage {
     },
     Done {
         summary: String,
-        result_path: PathBuf,
+        result_path: Option<PathBuf>,
+        verify_report: Option<VerifyReport>,
+        prune_missing_inputs: bool,
     },
     Cancelled,
     Error(String),
@@ -899,6 +918,8 @@ struct ArchiverApp {
     output_name: String,
 
     pending_archive: Option<PendingArchive>,
+    confirm_delete_source_modal: bool,
+    verify_result_modal: Option<VerifyReport>,
 
     // Интеграция с Windows
     context_menu_enabled: bool,
@@ -926,6 +947,7 @@ struct ArchiverApp {
     eta_secs: Option<f64>,
     status_text: String,
     is_error: bool,
+    last_task_succeeded: bool,
     last_result_path: Option<PathBuf>,
 
     rx: Option<Receiver<WorkerMessage>>,
@@ -958,6 +980,8 @@ impl ArchiverApp {
             split_preset: SplitPreset::None,
             output_name: String::new(),
             pending_archive: None,
+            confirm_delete_source_modal: false,
+            verify_result_modal: None,
             context_menu_enabled,
             context_menu_needs_update,
             assoc_main_enabled,
@@ -979,6 +1003,7 @@ impl ArchiverApp {
             eta_secs: None,
             status_text: "Готов к работе. Перетащи файлы, папку или архив.".to_string(),
             is_error: false,
+            last_task_succeeded: false,
             last_result_path: None,
             rx: None,
         };
@@ -1035,7 +1060,6 @@ impl ArchiverApp {
             return;
         };
 
-        // Если это установленная версия и на GitHub есть Setup.exe — скачиваем и запускаем поверх
         if self.is_installed_app {
             if let Some(url) = info.setup_download_url {
                 if self.update_downloading {
@@ -1059,7 +1083,6 @@ impl ArchiverApp {
             }
         }
 
-        // Для Portable-версии просто открываем страницу релиза в браузере
         win_native::open_url(&info.html_url);
     }
 
@@ -1197,6 +1220,7 @@ impl ArchiverApp {
                 }
                 Err(missing_err) => {
                     self.is_error = true;
+                    self.last_task_succeeded = false;
                     self.status_text = format!("Ошибка: {missing_err}");
                     return;
                 }
@@ -1219,6 +1243,25 @@ impl ArchiverApp {
         self.format = fmt;
         self.output_name = strip_archive_ext(&base_path);
         self.is_error = false;
+        self.last_task_succeeded = false;
+        self.last_result_path = None;
+        self.view = ActiveView::Main;
+        self.start_task(ctx);
+    }
+
+    fn setup_verify_and_start(
+        &mut self,
+        base_path: PathBuf,
+        volumes: Vec<PathBuf>,
+        fmt: ArchiveFormat,
+        ctx: &egui::Context,
+    ) {
+        self.inputs = volumes;
+        self.mode = AppMode::Verify;
+        self.format = fmt;
+        self.output_name = strip_archive_ext(&base_path);
+        self.is_error = false;
+        self.last_task_succeeded = false;
         self.last_result_path = None;
         self.view = ActiveView::Main;
         self.start_task(ctx);
@@ -1238,12 +1281,13 @@ impl ArchiverApp {
             self.suggest_output_name();
         }
         self.is_error = false;
+        self.last_task_succeeded = false;
         self.last_result_path = None;
         self.status_text = format!("Выбрано объектов: {}", self.inputs.len());
     }
 
     fn suggest_output_name(&mut self) {
-        if self.mode == AppMode::Extract && !self.inputs.is_empty() {
+        if matches!(self.mode, AppMode::Extract | AppMode::Verify) && !self.inputs.is_empty() {
             let base = parse_volume_path(&self.inputs[0])
                 .map(|v| v.base_path)
                 .unwrap_or_else(|| self.inputs[0].clone());
@@ -1288,6 +1332,9 @@ impl ArchiverApp {
     }
 
     fn target_path(&self) -> Option<PathBuf> {
+        if self.mode == AppMode::Verify {
+            return None;
+        }
         let dir = self.resolve_output_dir(None)?;
         let clean_name = sanitize_name(&self.output_name);
         if clean_name.is_empty() {
@@ -1305,6 +1352,7 @@ impl ArchiverApp {
                 dir.join(final_name)
             }
             AppMode::Extract => dir.join(clean_name),
+            AppMode::Verify => return None,
         };
 
         if self.config.overwrite_existing {
@@ -1329,24 +1377,31 @@ impl ArchiverApp {
             }
             if self.split_preset == SplitPreset::Custom && self.split_limit_bytes().is_none() {
                 self.is_error = true;
+                self.last_task_succeeded = false;
                 self.status_text = "Укажи размер части больше 0 МБ для Split Archive.".to_string();
                 return;
             }
         }
 
-        let Some(target) = self.target_path() else {
-            self.is_error = true;
-            self.status_text = "Укажи корректное имя для результата.".to_string();
-            return;
-        };
-
-        if let Some(parent) = target.parent() {
-            if let Err(err) = fs::create_dir_all(parent) {
+        let target_opt = if self.mode == AppMode::Verify {
+            None
+        } else {
+            let Some(target) = self.target_path() else {
                 self.is_error = true;
-                self.status_text = format!("Не удалось создать папку назначения: {err}");
+                self.last_task_succeeded = false;
+                self.status_text = "Укажи корректное имя для результата.".to_string();
                 return;
+            };
+            if let Some(parent) = target.parent() {
+                if let Err(err) = fs::create_dir_all(parent) {
+                    self.is_error = true;
+                    self.last_task_succeeded = false;
+                    self.status_text = format!("Не удалось создать папку назначения: {err}");
+                    return;
+                }
             }
-        }
+            Some(target)
+        };
 
         let (tx, rx) = mpsc::channel();
         let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -1354,6 +1409,7 @@ impl ArchiverApp {
         self.cancel_flag = Some(Arc::clone(&cancel_flag));
         self.is_busy = true;
         self.is_error = false;
+        self.last_task_succeeded = false;
         self.progress = Some(0.0_f32);
         self.bytes_done = 0;
         self.total_bytes = 0;
@@ -1368,55 +1424,126 @@ impl ArchiverApp {
         let level = self.level;
         let split_bytes = self.split_limit_bytes();
         let smart_skip = self.config.smart_skip_media_zip;
+        let verify_after_compress = self.config.verify_integrity_enabled;
+        let delete_source_after_extract = self.config.delete_source_after_extract;
         let threads = self.effective_threads();
         let ctx_clone = ctx.clone();
 
         thread::spawn(move || {
             let started = Instant::now();
-            let result = match mode {
-                AppMode::Compress => run_compress(
-                    &inputs,
-                    &target,
-                    format,
-                    level,
-                    split_bytes,
-                    smart_skip,
-                    threads,
-                    Arc::clone(&cancel_flag),
-                    tx.clone(),
-                    ctx_clone.clone(),
-                ),
-                AppMode::Extract => run_extract(
-                    &inputs,
-                    &target,
-                    format,
-                    threads,
-                    Arc::clone(&cancel_flag),
-                    tx.clone(),
-                    ctx_clone.clone(),
-                )
-                .map(|summary| (summary, target.clone())),
-            };
-
-            match result {
-                Ok((detail, final_path)) => {
-                    let secs = started.elapsed().as_secs_f64();
-                    let _ = tx.send(WorkerMessage::Done {
-                        summary: format!("Готово за {:.2} с • {}", secs, detail),
-                        result_path: final_path,
-                    });
-                }
-                Err(err) if err.contains(CANCELLED_MARKER) => {
-                    if mode == AppMode::Compress {
-                        cleanup_compress_artifacts(&target);
+            match mode {
+                AppMode::Compress => {
+                    let target = target_opt.expect("target required for compress");
+                    let result = run_compress(
+                        &inputs,
+                        &target,
+                        format,
+                        level,
+                        split_bytes,
+                        smart_skip,
+                        verify_after_compress,
+                        threads,
+                        Arc::clone(&cancel_flag),
+                        tx.clone(),
+                        ctx_clone.clone(),
+                    );
+                    match result {
+                        Ok((detail, final_path, verify_report)) => {
+                            let secs = started.elapsed().as_secs_f64();
+                            let _ = tx.send(WorkerMessage::Done {
+                                summary: format!("Готово за {:.2} с • {}", secs, detail),
+                                result_path: Some(final_path),
+                                verify_report,
+                                prune_missing_inputs: false,
+                            });
+                        }
+                        Err(err) if err.contains(CANCELLED_MARKER) => {
+                            cleanup_compress_artifacts(&target);
+                            let _ = tx.send(WorkerMessage::Cancelled);
+                        }
+                        Err(err) => {
+                            cleanup_compress_artifacts(&target);
+                            let _ = tx.send(WorkerMessage::Error(err));
+                        }
                     }
-                    let _ = tx.send(WorkerMessage::Cancelled);
                 }
-                Err(err) => {
-                    if mode == AppMode::Compress {
-                        cleanup_compress_artifacts(&target);
+                AppMode::Extract => {
+                    let target = target_opt.expect("target required for extract");
+                    let result = run_extract(
+                        &inputs,
+                        &target,
+                        format,
+                        delete_source_after_extract,
+                        threads,
+                        Arc::clone(&cancel_flag),
+                        tx.clone(),
+                        ctx_clone.clone(),
+                    );
+                    match result {
+                        Ok(detail) => {
+                            let secs = started.elapsed().as_secs_f64();
+                            let _ = tx.send(WorkerMessage::Done {
+                                summary: format!("Готово за {:.2} с • {}", secs, detail),
+                                result_path: Some(target),
+                                verify_report: None,
+                                prune_missing_inputs: delete_source_after_extract,
+                            });
+                        }
+                        Err(err) if err.contains(CANCELLED_MARKER) => {
+                            let _ = tx.send(WorkerMessage::Cancelled);
+                        }
+                        Err(err) => {
+                            let _ = tx.send(WorkerMessage::Error(err));
+                        }
                     }
-                    let _ = tx.send(WorkerMessage::Error(err));
+                }
+                AppMode::Verify => {
+                    let result = run_verify(
+                        &inputs,
+                        format,
+                        threads,
+                        Arc::clone(&cancel_flag),
+                        tx.clone(),
+                        ctx_clone.clone(),
+                    );
+                    match result {
+                        Ok((entries_count, checked_bytes)) => {
+                            let secs = started.elapsed().as_secs_f64();
+                            let base = parse_volume_path(&inputs[0])
+                                .map(|v| v.base_path)
+                                .unwrap_or_else(|| inputs[0].clone());
+                            let archive_name = base
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| base.display().to_string());
+                            let report = VerifyReport {
+                                title: "Проверка целостности".to_string(),
+                                headline: "Архив полностью исправен — нарушений не обнаружено."
+                                    .to_string(),
+                                archive_name,
+                                format_label: format.short_label().to_string(),
+                                parts_count: inputs.len(),
+                                entries_count,
+                                checked_bytes,
+                                elapsed_secs: secs,
+                            };
+                            let _ = tx.send(WorkerMessage::Done {
+                                summary: format!(
+                                    "Проверка пройдена за {:.2} с • объектов: {} • нарушений не найдено",
+                                    secs, entries_count
+                                ),
+                                result_path: None,
+                                verify_report: Some(report),
+                                prune_missing_inputs: false,
+                            });
+                        }
+                        Err(err) if err.contains(CANCELLED_MARKER) => {
+                            let _ = tx.send(WorkerMessage::Cancelled);
+                        }
+                        Err(err) => {
+                            let _ = tx.send(WorkerMessage::Error(err));
+                        }
+                    }
                 }
             }
             ctx_clone.request_repaint();
@@ -1447,19 +1574,36 @@ impl ArchiverApp {
                     WorkerMessage::Done {
                         summary,
                         result_path,
+                        verify_report,
+                        prune_missing_inputs,
                     } => {
                         self.is_busy = false;
                         self.is_error = false;
+                        self.last_task_succeeded = true;
                         self.progress = None;
                         self.eta_secs = None;
                         self.status_text = summary;
-                        self.last_result_path = Some(result_path);
+                        self.last_result_path = result_path;
+                        if verify_report.is_some() {
+                            self.verify_result_modal = verify_report;
+                        }
+                        if prune_missing_inputs {
+                            self.inputs.retain(|p| p.exists());
+                            if self.inputs.is_empty() {
+                                self.output_name.clear();
+                                self.mode = AppMode::Compress;
+                                if !self.format.can_compress() {
+                                    self.format = self.config.default_format;
+                                }
+                            }
+                        }
                         finished = true;
                         notify_done = true;
                     }
                     WorkerMessage::Cancelled => {
                         self.is_busy = false;
                         self.is_error = false;
+                        self.last_task_succeeded = false;
                         self.progress = None;
                         self.eta_secs = None;
                         self.status_text = "Операция отменена пользователем.".to_string();
@@ -1468,6 +1612,7 @@ impl ArchiverApp {
                     WorkerMessage::Error(err) => {
                         self.is_busy = false;
                         self.is_error = true;
+                        self.last_task_succeeded = false;
                         self.progress = None;
                         self.eta_secs = None;
                         self.status_text = format!("Ошибка: {err}");
@@ -1856,15 +2001,44 @@ impl ArchiverApp {
                 );
             });
 
-            // Поведение и уведомления
+            // Поведение, целостность и уведомления
             card_frame(p).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
-                    RichText::new("Поведение и уведомления")
+                    RichText::new("Поведение, целостность и уведомления")
                         .strong()
                         .color(p.text_primary),
                 );
                 ui.add_space(4.0_f32);
+
+                if ui
+                    .checkbox(
+                        &mut self.config.verify_integrity_enabled,
+                        "Проверка целостности архивов (автопроверка после сжатия + кнопка «Проверить» для архивов)",
+                    )
+                    .changed()
+                {
+                    if !self.config.verify_integrity_enabled && self.mode == AppMode::Verify {
+                        self.mode = AppMode::Extract;
+                    }
+                    changed = true;
+                }
+
+                let mut delete_src = self.config.delete_source_after_extract;
+                if ui
+                    .checkbox(
+                        &mut delete_src,
+                        "Автоматически удалять исходный архив после успешной распаковки (включая части .001/.002...)",
+                    )
+                    .changed()
+                {
+                    if delete_src {
+                        self.confirm_delete_source_modal = true;
+                    } else {
+                        self.config.delete_source_after_extract = false;
+                        changed = true;
+                    }
+                }
 
                 if ui
                     .checkbox(
@@ -2090,6 +2264,13 @@ impl ArchiverApp {
                             )
                         }
                         AppMode::Extract => "Режим: Распаковка (1)".to_string(),
+                        AppMode::Verify if self.inputs.len() > 1 => {
+                            format!(
+                                "Режим: Проверка целостности (многотомный • частей: {})",
+                                self.inputs.len()
+                            )
+                        }
+                        AppMode::Verify => "Режим: Проверка целостности (1)".to_string(),
                     };
                     ui.label(RichText::new(mode_badge).strong().color(p.accent));
 
@@ -2105,6 +2286,7 @@ impl ArchiverApp {
                                 self.format = self.config.default_format;
                             }
                             self.last_result_path = None;
+                            self.last_task_succeeded = false;
                             self.status_text = "Список очищен.".to_string();
                         }
                     });
@@ -2180,6 +2362,9 @@ impl ArchiverApp {
                     let old_mode = self.mode;
                     ui.add_enabled_ui(!self.is_busy, |ui| {
                         ui.selectable_value(&mut self.mode, AppMode::Extract, "Распаковать");
+                        if self.config.verify_integrity_enabled {
+                            ui.selectable_value(&mut self.mode, AppMode::Verify, "Проверить");
+                        }
                         ui.selectable_value(&mut self.mode, AppMode::Compress, "Переупаковать");
                     });
                     if old_mode != self.mode {
@@ -2239,7 +2424,6 @@ impl ArchiverApp {
                         }
                     });
 
-                    // Пояснение: отвечает именно за степень сжатия, а не за число потоков
                     ui.label(
                         RichText::new(self.level.hint())
                             .size(11.5_f32)
@@ -2282,52 +2466,87 @@ impl ArchiverApp {
                 });
             }
 
-            ui.horizontal(|ui| {
-                let name_label = match self.mode {
-                    AppMode::Compress => "Имя архива:",
-                    AppMode::Extract => "Папка распаковки:",
-                };
-                ui.label(RichText::new(name_label).strong());
-                ui.add_enabled(
-                    !self.is_busy,
-                    egui::TextEdit::singleline(&mut self.output_name)
-                        .hint_text("archive")
-                        .desired_width(270.0_f32),
+            if self.mode == AppMode::Verify {
+                ui.label(
+                    RichText::new(
+                        "Проверка выполняется в памяти без записи файлов на диск — сверяются потоки сжатия, структура и контрольные суммы всех частей.",
+                    )
+                    .size(12.0_f32)
+                    .color(p.text_muted),
                 );
-                if self.mode == AppMode::Compress {
-                    let ext_text = if self.split_limit_bytes().is_some() {
-                        format!("{}.001", self.format.extension())
-                    } else {
-                        self.format.extension().to_string()
+            } else {
+                ui.horizontal(|ui| {
+                    let name_label = match self.mode {
+                        AppMode::Compress => "Имя архива:",
+                        AppMode::Extract => "Папка распаковки:",
+                        AppMode::Verify => "",
                     };
-                    ui.label(RichText::new(ext_text).strong().color(p.accent));
-                }
-            });
-
-            let dest_preview = match self.target_path() {
-                Some(t) => {
+                    ui.label(RichText::new(name_label).strong());
+                    ui.add_enabled(
+                        !self.is_busy,
+                        egui::TextEdit::singleline(&mut self.output_name)
+                            .hint_text("archive")
+                            .desired_width(270.0_f32),
+                    );
                     if self.mode == AppMode::Compress {
-                        if let Some(limit_lbl) = self.split_limit_label() {
-                            format!(
-                                "Сохранится в: {} (части .001, .002... по {limit_lbl})",
-                                t.display()
-                            )
+                        let ext_text = if self.split_limit_bytes().is_some() {
+                            format!("{}.001", self.format.extension())
+                        } else {
+                            self.format.extension().to_string()
+                        };
+                        ui.label(RichText::new(ext_text).strong().color(p.accent));
+                    }
+                });
+
+                let dest_preview = match self.target_path() {
+                    Some(t) => {
+                        if self.mode == AppMode::Compress {
+                            if let Some(limit_lbl) = self.split_limit_label() {
+                                format!(
+                                    "Сохранится в: {} (части .001, .002... по {limit_lbl})",
+                                    t.display()
+                                )
+                            } else {
+                                format!("Сохранится в: {}", t.display())
+                            }
                         } else {
                             format!("Сохранится в: {}", t.display())
                         }
-                    } else {
-                        format!("Сохранится в: {}", t.display())
                     }
-                }
-                None => match self.resolve_output_dir(None) {
-                    Some(dir) => format!("Папка сохранения: {}", dir.display()),
-                    None => "Папка сохранения: рядом с исходными файлами".to_string(),
-                },
-            };
-            ui.add(
-                egui::Label::new(RichText::new(dest_preview).size(12.0_f32).color(p.text_muted))
+                    None => match self.resolve_output_dir(None) {
+                        Some(dir) => format!("Папка сохранения: {}", dir.display()),
+                        None => "Папка сохранения: рядом с исходными файлами".to_string(),
+                    },
+                };
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(dest_preview)
+                            .size(12.0_f32)
+                            .color(p.text_muted),
+                    )
                     .truncate(),
-            );
+                );
+
+                if self.mode == AppMode::Compress && self.config.verify_integrity_enabled {
+                    ui.label(
+                        RichText::new(
+                            "После сжатия автоматически запустится проверка целостности архива.",
+                        )
+                        .size(11.5_f32)
+                        .color(p.text_muted),
+                    );
+                }
+
+                if self.mode == AppMode::Extract && self.config.delete_source_after_extract {
+                    ui.label(
+                        RichText::new(
+                            "Внимание: исходный архив будет удалён после успешной распаковки (включено в Настройках).",
+                        )
+                        .size(11.5_f32)
+                        .color(p.accent),
+                    );
+                }
+            }
         });
 
         // Кнопки действия
@@ -2336,10 +2555,10 @@ impl ArchiverApp {
                 || self.split_preset != SplitPreset::Custom
                 || self.split_limit_bytes().is_some();
 
-            let can_run = !self.is_busy
-                && !self.inputs.is_empty()
-                && !sanitize_name(&self.output_name).is_empty()
-                && split_ok;
+            let name_ok =
+                self.mode == AppMode::Verify || !sanitize_name(&self.output_name).is_empty();
+
+            let can_run = !self.is_busy && !self.inputs.is_empty() && name_ok && split_ok;
 
             if self.is_busy {
                 let cancel_btn = egui::Button::new(
@@ -2362,6 +2581,7 @@ impl ArchiverApp {
                 let action_text = match self.mode {
                     AppMode::Compress => "Сжать сейчас",
                     AppMode::Extract => "Распаковать сейчас",
+                    AppMode::Verify => "Проверить целостность",
                 };
 
                 let main_btn = egui::Button::new(
@@ -2371,7 +2591,7 @@ impl ArchiverApp {
                         .color(if can_run { Color32::WHITE } else { p.text_muted }),
                 )
                 .fill(if can_run { p.accent } else { p.btn_bg })
-                .min_size(Vec2::new(200.0_f32, 40.0_f32))
+                .min_size(Vec2::new(205.0_f32, 40.0_f32))
                 .rounding(Rounding::same(6.0_f32));
 
                 if ui.add_enabled(can_run, main_btn).clicked() {
@@ -2393,12 +2613,11 @@ impl ArchiverApp {
             }
         });
 
-        // Двухстрочный прогресс-бар (имя файла больше никогда не перекрывает скорость и ETA)
+        // Двухстрочный прогресс-бар
         if self.is_busy {
             ui.add_space(4.0_f32);
             draw_slim_progress_bar(ui, self.progress, p);
 
-            // Строка 1: текущая операция и имя файла с аккуратной обрезкой
             ui.add(
                 egui::Label::new(
                     RichText::new(&self.status_text)
@@ -2408,7 +2627,6 @@ impl ArchiverApp {
                 .truncate(),
             );
 
-            // Строка 2: проценты, байты, скорость в МБ/с и оставшееся время (ETA)
             let metrics = if self.total_bytes > 0 {
                 let pct = self.progress.unwrap_or(0.0_f32) * 100.0_f32;
                 let eta_part = match self.eta_secs {
@@ -2436,7 +2654,7 @@ impl ArchiverApp {
         } else {
             let status_color = if self.is_error {
                 p.error
-            } else if self.last_result_path.is_some() {
+            } else if self.last_task_succeeded {
                 p.success
             } else {
                 p.text_muted
@@ -2466,6 +2684,7 @@ impl ArchiverApp {
             .resolve_output_dir(Some(&volumes[0]))
             .map(|d| d.join(strip_archive_ext(&base_path)).display().to_string())
             .unwrap_or_else(|| strip_archive_ext(&base_path));
+        let show_verify = self.config.verify_integrity_enabled;
 
         let mut action: Option<u8> = None;
 
@@ -2473,7 +2692,7 @@ impl ArchiverApp {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .max_width(440.0_f32)
+            .max_width(510.0_f32)
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(8.0_f32, 10.0_f32);
                 let header = if parts_count > 1 {
@@ -2501,24 +2720,36 @@ impl ArchiverApp {
                 );
 
                 ui.add_space(6.0_f32);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let extract_btn = egui::Button::new(
                         RichText::new("Распаковать")
                             .strong()
                             .color(Color32::WHITE),
                     )
                     .fill(p.accent)
-                    .min_size(Vec2::new(130.0_f32, 34.0_f32))
+                    .min_size(Vec2::new(124.0_f32, 34.0_f32))
                     .rounding(Rounding::same(6.0_f32));
 
                     if ui.add(extract_btn).clicked() {
                         action = Some(1);
                     }
 
+                    if show_verify
+                        && ui
+                            .add(
+                                egui::Button::new("Проверить")
+                                    .min_size(Vec2::new(105.0_f32, 34.0_f32))
+                                    .rounding(Rounding::same(6.0_f32)),
+                            )
+                            .clicked()
+                    {
+                        action = Some(4);
+                    }
+
                     if ui
                         .add(
                             egui::Button::new("Добавить к упаковке")
-                                .min_size(Vec2::new(160.0_f32, 34.0_f32))
+                                .min_size(Vec2::new(150.0_f32, 34.0_f32))
                                 .rounding(Rounding::same(6.0_f32)),
                         )
                         .clicked()
@@ -2529,7 +2760,7 @@ impl ArchiverApp {
                     if ui
                         .add(
                             egui::Button::new("Отмена")
-                                .min_size(Vec2::new(80.0_f32, 34.0_f32))
+                                .min_size(Vec2::new(78.0_f32, 34.0_f32))
                                 .rounding(Rounding::same(6.0_f32)),
                         )
                         .clicked()
@@ -2551,7 +2782,165 @@ impl ArchiverApp {
             Some(3) => {
                 self.pending_archive = None;
             }
+            Some(4) => {
+                self.pending_archive = None;
+                self.setup_verify_and_start(base_path, volumes, archive_fmt, ctx);
+            }
             _ => {}
+        }
+    }
+
+    fn render_delete_confirm_modal(&mut self, ctx: &egui::Context, p: Palette) {
+        if !self.confirm_delete_source_modal {
+            return;
+        }
+
+        let mut decision: Option<bool> = None;
+
+        egui::Window::new("Подтверждение автоудаления")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .max_width(460.0_f32)
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(8.0_f32, 10.0_f32);
+                ui.label(
+                    RichText::new("Вы действительно хотите включить автоудаление исходного архива?")
+                        .size(14.5_f32)
+                        .strong()
+                        .color(p.error),
+                );
+                ui.label(
+                    RichText::new(
+                        "После каждой успешной распаковки исходный архив (а для многотомного — сразу все части .001, .002...) будет безвозвратно удалён с диска, минуя Корзину.",
+                    )
+                    .size(12.5_f32)
+                    .color(p.text_primary),
+                );
+                ui.label(
+                    RichText::new(
+                        "Это несёт риск случайно потерять нужный файл. Если распаковка прервётся ошибкой или отменой, исходный архив останется нетронутым.",
+                    )
+                    .size(12.0_f32)
+                    .color(p.text_muted),
+                );
+
+                ui.add_space(6.0_f32);
+                ui.horizontal(|ui| {
+                    let confirm_btn = egui::Button::new(
+                        RichText::new("Да, включить автоудаление")
+                            .strong()
+                            .color(Color32::WHITE),
+                    )
+                    .fill(p.error)
+                    .min_size(Vec2::new(195.0_f32, 34.0_f32))
+                    .rounding(Rounding::same(6.0_f32));
+
+                    if ui.add(confirm_btn).clicked() {
+                        decision = Some(true);
+                    }
+
+                    if ui
+                        .add(
+                            egui::Button::new("Отмена")
+                                .min_size(Vec2::new(96.0_f32, 34.0_f32))
+                                .rounding(Rounding::same(6.0_f32)),
+                        )
+                        .clicked()
+                    {
+                        decision = Some(false);
+                    }
+                });
+            });
+
+        if let Some(accepted) = decision {
+            self.confirm_delete_source_modal = false;
+            if accepted {
+                self.config.delete_source_after_extract = true;
+                save_config(&self.config);
+            }
+        }
+    }
+
+    fn render_verify_result_modal(&mut self, ctx: &egui::Context, p: Palette) {
+        let Some(report) = self.verify_result_modal.clone() else {
+            return;
+        };
+
+        let mut close = false;
+        let show_explorer_path = self.last_result_path.clone();
+
+        egui::Window::new(&report.title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .max_width(450.0_f32)
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(8.0_f32, 9.0_f32);
+                ui.label(
+                    RichText::new(&report.headline)
+                        .size(14.5_f32)
+                        .strong()
+                        .color(p.success),
+                );
+
+                let parts_note = if report.parts_count > 1 {
+                    format!("  •  частей: {}", report.parts_count)
+                } else {
+                    String::new()
+                };
+                ui.label(
+                    RichText::new(format!(
+                        "Архив: {} ({}{})",
+                        report.archive_name, report.format_label, parts_note
+                    ))
+                    .size(12.5_f32)
+                    .color(p.text_primary),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "Проверено объектов: {}  •  Объём: {}  •  Время: {:.2} с",
+                        report.entries_count,
+                        format_bytes(report.checked_bytes),
+                        report.elapsed_secs
+                    ))
+                    .size(12.0_f32)
+                    .color(p.text_muted),
+                );
+
+                ui.add_space(6.0_f32);
+                ui.horizontal(|ui| {
+                    let ok_btn = egui::Button::new(
+                        RichText::new("Отлично")
+                            .strong()
+                            .color(Color32::WHITE),
+                    )
+                    .fill(p.accent)
+                    .min_size(Vec2::new(115.0_f32, 34.0_f32))
+                    .rounding(Rounding::same(6.0_f32));
+
+                    if ui.add(ok_btn).clicked() {
+                        close = true;
+                    }
+
+                    if let Some(res_path) = &show_explorer_path {
+                        if ui
+                            .add(
+                                egui::Button::new("Показать в проводнике")
+                                    .min_size(Vec2::new(175.0_f32, 34.0_f32))
+                                    .rounding(Rounding::same(6.0_f32)),
+                            )
+                            .clicked()
+                        {
+                            open_in_explorer(res_path);
+                            close = true;
+                        }
+                    }
+                });
+            });
+
+        if close {
+            self.verify_result_modal = None;
         }
     }
 }
@@ -2562,7 +2951,11 @@ impl eframe::App for ArchiverApp {
         self.poll_updates();
 
         let p = Palette::for_theme(self.config.theme);
-        let is_hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        let modal_open = self.pending_archive.is_some()
+            || self.confirm_delete_source_modal
+            || self.verify_result_modal.is_some();
+
+        let is_hovering = !modal_open && ctx.input(|i| !i.raw.hovered_files.is_empty());
         let dropped_paths: Vec<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -2570,12 +2963,10 @@ impl eframe::App for ArchiverApp {
                 .filter_map(|f| f.path.clone())
                 .collect()
         });
-        if !dropped_paths.is_empty() && self.pending_archive.is_none() {
+        if !dropped_paths.is_empty() && !modal_open {
             self.view = ActiveView::Main;
             self.add_paths(dropped_paths, true, ctx);
         }
-
-        let modal_open = self.pending_archive.is_some();
 
         egui::CentralPanel::default()
             .frame(Frame::default().fill(p.bg).inner_margin(Margin::same(16.0_f32)))
@@ -2593,6 +2984,8 @@ impl eframe::App for ArchiverApp {
             });
 
         self.render_archive_confirm_modal(ctx, p);
+        self.render_delete_confirm_modal(ctx, p);
+        self.render_verify_result_modal(ctx, p);
     }
 }
 
@@ -3310,7 +3703,7 @@ impl<W: Write> Write for ParallelGzipWriter<W> {
     }
 }
 
-// ---------- Логика сжатия и распаковки ----------
+// ---------- Логика сжатия, распаковки и проверки целостности ----------
 
 #[allow(clippy::too_many_arguments)]
 fn run_compress(
@@ -3320,11 +3713,12 @@ fn run_compress(
     level: CompressionLevel,
     split_bytes: Option<u64>,
     smart_skip_media_zip: bool,
+    verify_after_compress: bool,
     threads: usize,
     cancel: Arc<AtomicBool>,
     tx: Sender<WorkerMessage>,
     ctx: egui::Context,
-) -> Result<(String, PathBuf), String> {
+) -> Result<(String, PathBuf, Option<VerifyReport>), String> {
     let pool = Arc::new(build_thread_pool(threads)?);
 
     let scan_tracker = ProgressTracker::new(0, Arc::clone(&cancel), tx.clone(), ctx.clone());
@@ -3382,13 +3776,13 @@ fn run_compress(
         String::new()
     };
 
-    if let Some(limit) = split_bytes {
+    let (mut summary_detail, final_path, produced_volumes) = if let Some(limit) = split_bytes {
         if out_size <= limit {
             if output_path.exists() {
                 let _ = fs::remove_file(output_path);
             }
             fs::rename(&work_path, output_path).map_err(|e| e.to_string())?;
-            return Ok((
+            (
                 format!(
                     "{} -> {}{} • уместился в 1 файл",
                     format_bytes(raw_size),
@@ -3396,38 +3790,82 @@ fn run_compress(
                     ratio
                 ),
                 output_path.to_path_buf(),
-            ));
+                vec![output_path.to_path_buf()],
+            )
+        } else {
+            let (parts_count, first_part) = split_file_into_volumes(
+                &work_path,
+                output_path,
+                limit,
+                Arc::clone(&cancel),
+                tx.clone(),
+                ctx.clone(),
+            )?;
+            let vols = (1..=parts_count)
+                .map(|i| volume_part_path(output_path, i, 3))
+                .collect();
+            (
+                format!(
+                    "{} -> {}{} • частей: {parts_count}",
+                    format_bytes(raw_size),
+                    format_bytes(out_size),
+                    ratio
+                ),
+                first_part,
+                vols,
+            )
         }
-
-        let (parts_count, first_part) =
-            split_file_into_volumes(&work_path, output_path, limit, cancel, tx, ctx)?;
-
-        return Ok((
+    } else {
+        (
             format!(
-                "{} -> {}{} • частей: {parts_count}",
+                "{} -> {}{}",
                 format_bytes(raw_size),
                 format_bytes(out_size),
                 ratio
             ),
-            first_part,
-        ));
-    }
+            output_path.to_path_buf(),
+            vec![output_path.to_path_buf()],
+        )
+    };
 
-    Ok((
-        format!(
-            "{} -> {}{}",
-            format_bytes(raw_size),
-            format_bytes(out_size),
-            ratio
-        ),
-        output_path.to_path_buf(),
-    ))
+    let verify_report = if verify_after_compress {
+        let verify_started = Instant::now();
+        let (entries_count, checked_bytes) =
+            run_verify(&produced_volumes, format, threads, cancel, tx, ctx).map_err(|err| {
+                if err.contains(CANCELLED_MARKER) {
+                    err
+                } else {
+                    format!("Автопроверка выявила повреждение архива: {err}")
+                }
+            })?;
+        let archive_name = output_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| output_path.display().to_string());
+        summary_detail.push_str(" • целостность ОК");
+        Some(VerifyReport {
+            title: "Автопроверка целостности".to_string(),
+            headline: "Автоматическая проверка не выявила нарушений и повреждений.".to_string(),
+            archive_name,
+            format_label: format.short_label().to_string(),
+            parts_count: produced_volumes.len(),
+            entries_count,
+            checked_bytes,
+            elapsed_secs: verify_started.elapsed().as_secs_f64(),
+        })
+    } else {
+        None
+    };
+
+    Ok((summary_detail, final_path, verify_report))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_extract(
     volumes: &[PathBuf],
     extract_dir: &Path,
     format: ArchiveFormat,
+    delete_source_after_extract: bool,
     threads: usize,
     cancel: Arc<AtomicBool>,
     tx: Sender<WorkerMessage>,
@@ -3449,12 +3887,65 @@ fn run_extract(
     };
 
     match res {
-        Ok(()) => Ok(format!("Распаковано в {}", extract_dir.display())),
+        Ok(()) => {
+            let mut summary = format!("Распаковано в {}", extract_dir.display());
+            if delete_source_after_extract {
+                let mut deleted = 0usize;
+                let mut failed = 0usize;
+                for vol in volumes {
+                    match fs::remove_file(vol) {
+                        Ok(()) => deleted += 1,
+                        Err(_) => failed += 1,
+                    }
+                }
+                if failed == 0 && deleted > 0 {
+                    if deleted > 1 {
+                        summary.push_str(&format!(" • исходные части удалены ({deleted})"));
+                    } else {
+                        summary.push_str(" • исходный архив удалён");
+                    }
+                } else if failed > 0 {
+                    summary.push_str(" • не удалось удалить исходный архив (файл занят)");
+                }
+            }
+            Ok(summary)
+        }
         Err(err) if err.contains(CANCELLED_MARKER) => Err(err),
         Err(err) if volumes.len() > 1 => Err(format!(
             "{err} (Проверь, что все части архива .001, .002... скачаны в одну папку)"
         )),
         Err(err) => Err(err),
+    }
+}
+
+fn run_verify(
+    volumes: &[PathBuf],
+    format: ArchiveFormat,
+    threads: usize,
+    cancel: Arc<AtomicBool>,
+    tx: Sender<WorkerMessage>,
+    ctx: egui::Context,
+) -> Result<(usize, u64), String> {
+    let pool = build_thread_pool(threads)?;
+
+    let res = match format {
+        ArchiveFormat::Zip => verify_zip_parallel(volumes, &pool, cancel, tx, ctx),
+        ArchiveFormat::SevenZ => verify_7z(volumes, cancel, tx, ctx),
+        ArchiveFormat::TarZst
+        | ArchiveFormat::TarXz
+        | ArchiveFormat::TarBr
+        | ArchiveFormat::TarGz
+        | ArchiveFormat::TarLz4
+        | ArchiveFormat::TarBz2 => verify_tar_stream(volumes, format, cancel, tx, ctx),
+    };
+
+    match res {
+        Ok(stats) => Ok(stats),
+        Err(err) if err.contains(CANCELLED_MARKER) => Err(err),
+        Err(err) if volumes.len() > 1 => Err(format!(
+            "Нарушена целостность: {err} (Проверь, что все части .001, .002... скачаны полностью)"
+        )),
+        Err(err) => Err(format!("Нарушена целостность архива: {err}")),
     }
 }
 
@@ -4097,6 +4588,204 @@ fn unpack_tar_entries<R: Read>(
         entry.unpack_in(extract_dir).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+// ---------- Проверка целостности архивов в памяти (без записи на диск) ----------
+
+fn verify_zip_parallel(
+    volumes: &[PathBuf],
+    pool: &rayon::ThreadPool,
+    cancel: Arc<AtomicBool>,
+    tx: Sender<WorkerMessage>,
+    ctx: egui::Context,
+) -> Result<(usize, u64), String> {
+    let mut file_indices = Vec::new();
+    let mut total_bytes: u64 = 0;
+    let total_entries: usize;
+    {
+        let reader = MultiVolumeReader::open(volumes).map_err(|e| e.to_string())?;
+        let mut archive = zip::ZipArchive::new(reader).map_err(|e| e.to_string())?;
+        total_entries = archive.len();
+        for i in 0..archive.len() {
+            let entry = archive.by_index(i).map_err(|e| e.to_string())?;
+            if !entry.is_dir() {
+                total_bytes += entry.size();
+                file_indices.push(i);
+            }
+        }
+    }
+
+    let tracker = ProgressTracker::new(total_bytes, cancel, tx, ctx);
+    let total_files = file_indices.len().max(1);
+    let done_files = Arc::new(AtomicUsize::new(0));
+
+    pool.install(|| {
+        file_indices.par_iter().try_for_each_init(
+            || -> Result<zip::ZipArchive<MultiVolumeReader>, String> {
+                let r = MultiVolumeReader::open(volumes).map_err(|e| e.to_string())?;
+                zip::ZipArchive::new(r).map_err(|e| e.to_string())
+            },
+            |archive_res, &idx| -> Result<(), String> {
+                if tracker.is_cancelled() {
+                    return Err(CANCELLED_MARKER.to_string());
+                }
+                let archive = archive_res.as_mut().map_err(|e| e.clone())?;
+                let mut entry = archive.by_index(idx).map_err(|e| e.to_string())?;
+                let completed = done_files.fetch_add(1, Ordering::Relaxed) + 1;
+                tracker.set_label(format!(
+                    "Проверка ZIP ({completed}/{total_files}): {}",
+                    entry.name()
+                ));
+
+                let buf_sz = adaptive_buffer_size(entry.size());
+                let mut sink = io::sink();
+                copy_with_progress(&mut entry, &mut sink, buf_sz, &tracker)?;
+                Ok(())
+            },
+        )
+    })?;
+
+    let checked_bytes = tracker.bytes_done.load(Ordering::Relaxed);
+    Ok((total_entries, checked_bytes))
+}
+
+fn verify_7z(
+    volumes: &[PathBuf],
+    cancel: Arc<AtomicBool>,
+    tx: Sender<WorkerMessage>,
+    ctx: egui::Context,
+) -> Result<(usize, u64), String> {
+    let tracker = ProgressTracker::new(0, cancel, tx, ctx);
+    let reader = MultiVolumeReader::open(volumes).map_err(|e| e.to_string())?;
+    let dummy_dir = std::env::temp_dir();
+    let mut count = 0usize;
+    let mut read_err: Option<String> = None;
+
+    let res = sevenz_rust2::decompress_with_extract_fn(
+        reader,
+        &dummy_dir,
+        |entry, entry_reader, _dest| {
+            if tracker.is_cancelled() {
+                return Ok(false);
+            }
+            count += 1;
+            tracker.set_label(format!(
+                "Проверка 7Z (объектов: {count}): {}",
+                entry.name()
+            ));
+            let mut pr = ProgressReader::new(entry_reader, Arc::clone(&tracker));
+            if let Err(e) = io::copy(&mut pr, &mut io::sink()) {
+                read_err = Some(e.to_string());
+                return Ok(false);
+            }
+            Ok(true)
+        },
+    );
+
+    if tracker.is_cancelled() {
+        return Err(CANCELLED_MARKER.to_string());
+    }
+    if let Some(err) = read_err {
+        return Err(err);
+    }
+    res.map_err(|e| e.to_string())?;
+
+    let checked_bytes = tracker.bytes_done.load(Ordering::Relaxed);
+    Ok((count, checked_bytes))
+}
+
+fn verify_tar_stream(
+    volumes: &[PathBuf],
+    format: ArchiveFormat,
+    cancel: Arc<AtomicBool>,
+    tx: Sender<WorkerMessage>,
+    ctx: egui::Context,
+) -> Result<(usize, u64), String> {
+    let reader = MultiVolumeReader::open(volumes).map_err(|e| e.to_string())?;
+    let total_size = reader.total_len();
+    let tracker = ProgressTracker::new(total_size, cancel, tx, ctx);
+
+    let buf_sz = adaptive_buffer_size(total_size);
+    let progress_reader =
+        BufReader::with_capacity(buf_sz, ProgressReader::new(reader, Arc::clone(&tracker)));
+
+    let count = match format {
+        ArchiveFormat::TarZst => {
+            let decoder = zstd::stream::read::Decoder::new(progress_reader)
+                .map_err(|e| e.to_string())?;
+            verify_tar_entries(decoder, "TAR.ZST", &tracker)?
+        }
+        ArchiveFormat::TarXz => {
+            let decoder = lzma_rust2::XzReader::new(progress_reader, true);
+            verify_tar_entries(decoder, "TAR.XZ", &tracker)?
+        }
+        ArchiveFormat::TarBr => {
+            let decoder = brotli::Decompressor::new(progress_reader, 64 * 1024);
+            verify_tar_entries(decoder, "TAR.BR", &tracker)?
+        }
+        ArchiveFormat::TarGz => {
+            let decoder = MultiGzDecoder::new(progress_reader);
+            verify_tar_entries(decoder, "TAR.GZ", &tracker)?
+        }
+        ArchiveFormat::TarLz4 => {
+            let decoder = lz4_flex::frame::FrameDecoder::new(progress_reader);
+            verify_tar_entries(decoder, "TAR.LZ4", &tracker)?
+        }
+        ArchiveFormat::TarBz2 => {
+            let decoder = bzip2::read::MultiBzDecoder::new(progress_reader);
+            verify_tar_entries(decoder, "TAR.BZ2", &tracker)?
+        }
+        _ => return Err("Неподдерживаемый потоковый формат.".to_string()),
+    };
+
+    let checked_bytes = tracker.bytes_done.load(Ordering::Relaxed);
+    Ok((count, checked_bytes))
+}
+
+fn verify_tar_entries<R: Read>(
+    decoder: R,
+    tag: &str,
+    tracker: &Arc<ProgressTracker>,
+) -> Result<usize, String> {
+    let mut archive = tar::Archive::new(decoder);
+    let mut count = 0usize;
+    let mut buf = vec![0u8; 256 * 1024];
+
+    for entry_res in archive.entries().map_err(|e| e.to_string())? {
+        if tracker.is_cancelled() {
+            return Err(CANCELLED_MARKER.to_string());
+        }
+        let mut entry = entry_res.map_err(|e| e.to_string())?;
+        let name = entry
+            .path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "файл".to_string());
+        count += 1;
+        tracker.set_label(format!("Проверка {tag} (объектов: {count}): {name}"));
+        loop {
+            if tracker.is_cancelled() {
+                return Err(CANCELLED_MARKER.to_string());
+            }
+            let n = entry.read(&mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+        }
+    }
+
+    // Дочитываем хвост сжатого потока до EOF, чтобы гарантированно проверить финальные контрольные суммы
+    let mut inner = archive.into_inner();
+    loop {
+        if tracker.is_cancelled() {
+            return Err(CANCELLED_MARKER.to_string());
+        }
+        let n = inner.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+    }
+
+    Ok(count)
 }
 
 // ---------- Вспомогательные функции ----------
