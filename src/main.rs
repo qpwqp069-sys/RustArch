@@ -22,7 +22,7 @@ use rayon::prelude::*;
 use rustfs_mimalloc::MiMalloc;
 use serde::{Deserialize, Serialize};
 use sevenz_rust2::encoder_options::Lzma2Options;
-use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+use sevenz_rust2::{ArchiveEntry, ArchiveReader, ArchiveWriter, Password};
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 use zip::CompressionMethod;
@@ -35,6 +35,8 @@ const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GITHUB_LATEST_API: &str =
     "https://api.github.com/repos/qpwqp069-sys/RustArch/releases/latest";
 const CANCELLED_MARKER: &str = "__RUSTARCH_CANCELLED__";
+const PASSWORD_REQUIRED_MARKER: &str = "__RUSTARCH_PASSWORD_REQUIRED__";
+const BAD_PASSWORD_MARKER: &str = "__RUSTARCH_BAD_PASSWORD__";
 const ZIP64_THRESHOLD_BYTES: u64 = 3_800_000_000;
 const ZIP_PARALLEL_MAX_FILE_SIZE: u64 = 32 * 1024 * 1024;
 const ZIP_PARALLEL_BATCH_BYTES: u64 = 128 * 1024 * 1024;
@@ -887,6 +889,9 @@ enum WorkerMessage {
         verify_report: Option<VerifyReport>,
         prune_missing_inputs: bool,
     },
+    PasswordRequired {
+        bad_password: bool,
+    },
     Cancelled,
     Error(String),
 }
@@ -902,6 +907,16 @@ struct PendingArchive {
     base_path: PathBuf,
     volumes: Vec<PathBuf>,
     format: ArchiveFormat,
+    encrypted: bool,
+}
+
+struct PasswordPrompt {
+    archive_name: String,
+    target_mode: AppMode,
+    password: String,
+    show_password: bool,
+    error_message: Option<String>,
+    just_opened: bool,
 }
 
 struct ArchiverApp {
@@ -916,8 +931,11 @@ struct ArchiverApp {
     split_preset: SplitPreset,
     custom_split_input: String,
     output_name: String,
+    current_archive_encrypted: bool,
+    active_password: Option<String>,
 
     pending_archive: Option<PendingArchive>,
+    password_prompt: Option<PasswordPrompt>,
     confirm_delete_source_modal: bool,
     verify_result_modal: Option<VerifyReport>,
 
@@ -979,7 +997,10 @@ impl ArchiverApp {
             mode: AppMode::Compress,
             split_preset: SplitPreset::None,
             output_name: String::new(),
+            current_archive_encrypted: false,
+            active_password: None,
             pending_archive: None,
+            password_prompt: None,
             confirm_delete_source_modal: false,
             verify_result_modal: None,
             context_menu_enabled,
@@ -1068,10 +1089,8 @@ impl ArchiverApp {
                 let (tx, rx) = mpsc::channel();
                 self.update_rx = Some(rx);
                 self.update_downloading = true;
-                self.update_notice = Some((
-                    format!("Скачиваю установщик {}...", info.tag),
-                    false,
-                ));
+                self.update_notice =
+                    Some((format!("Скачиваю установщик {}...", info.tag), false));
                 let tag = info.tag.clone();
                 let ctx_clone = ctx.clone();
                 thread::spawn(move || {
@@ -1188,6 +1207,30 @@ impl ArchiverApp {
         }
     }
 
+    fn current_archive_display_name(&self) -> String {
+        if let Some(first) = self.inputs.first() {
+            let base = parse_volume_path(first)
+                .map(|v| v.base_path)
+                .unwrap_or_else(|| first.clone());
+            base.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| base.display().to_string())
+        } else {
+            "archive".to_string()
+        }
+    }
+
+    fn open_password_prompt(&mut self, error_message: Option<String>) {
+        self.password_prompt = Some(PasswordPrompt {
+            archive_name: self.current_archive_display_name(),
+            target_mode: self.mode,
+            password: String::new(),
+            show_password: true,
+            error_message,
+            just_opened: true,
+        });
+    }
+
     fn add_paths(&mut self, paths: Vec<PathBuf>, from_drop: bool, ctx: &egui::Context) {
         if paths.is_empty() || self.is_busy {
             return;
@@ -1203,17 +1246,24 @@ impl ArchiverApp {
 
         if let Some(candidate) = single_archive_candidate {
             match inspect_archive_candidate(&candidate) {
-                Ok(Some((base_path, fmt, volumes))) => {
+                Ok(Some(inspected)) => {
                     if from_drop
                         && self.config.auto_extract_without_confirm
                         && self.inputs.is_empty()
                     {
-                        self.setup_extract_and_start(base_path, volumes, fmt, ctx);
+                        self.setup_extract_and_start(
+                            inspected.base_path,
+                            inspected.volumes,
+                            inspected.format,
+                            inspected.encrypted,
+                            ctx,
+                        );
                     } else {
                         self.pending_archive = Some(PendingArchive {
-                            base_path,
-                            volumes,
-                            format: fmt,
+                            base_path: inspected.base_path,
+                            volumes: inspected.volumes,
+                            format: inspected.format,
+                            encrypted: inspected.encrypted,
                         });
                     }
                     return;
@@ -1236,11 +1286,14 @@ impl ArchiverApp {
         base_path: PathBuf,
         volumes: Vec<PathBuf>,
         fmt: ArchiveFormat,
+        encrypted: bool,
         ctx: &egui::Context,
     ) {
         self.inputs = volumes;
         self.mode = AppMode::Extract;
         self.format = fmt;
+        self.current_archive_encrypted = encrypted;
+        self.active_password = None;
         self.output_name = strip_archive_ext(&base_path);
         self.is_error = false;
         self.last_task_succeeded = false;
@@ -1254,11 +1307,14 @@ impl ArchiverApp {
         base_path: PathBuf,
         volumes: Vec<PathBuf>,
         fmt: ArchiveFormat,
+        encrypted: bool,
         ctx: &egui::Context,
     ) {
         self.inputs = volumes;
         self.mode = AppMode::Verify;
         self.format = fmt;
+        self.current_archive_encrypted = encrypted;
+        self.active_password = None;
         self.output_name = strip_archive_ext(&base_path);
         self.is_error = false;
         self.last_task_succeeded = false;
@@ -1269,6 +1325,8 @@ impl ArchiverApp {
 
     fn append_for_compress(&mut self, paths: Vec<PathBuf>) {
         self.mode = AppMode::Compress;
+        self.current_archive_encrypted = false;
+        self.active_password = None;
         if !self.format.can_compress() {
             self.format = self.config.default_format;
         }
@@ -1371,6 +1429,16 @@ impl ArchiverApp {
             return;
         }
 
+        if matches!(self.mode, AppMode::Extract | AppMode::Verify)
+            && self.current_archive_encrypted
+            && self.active_password.is_none()
+        {
+            self.is_error = false;
+            self.status_text = "Архив защищён паролем — введи пароль для продолжения.".to_string();
+            self.open_password_prompt(None);
+            return;
+        }
+
         if self.mode == AppMode::Compress {
             if !self.format.can_compress() {
                 self.format = self.config.default_format;
@@ -1426,6 +1494,7 @@ impl ArchiverApp {
         let smart_skip = self.config.smart_skip_media_zip;
         let verify_after_compress = self.config.verify_integrity_enabled;
         let delete_source_after_extract = self.config.delete_source_after_extract;
+        let password = self.active_password.clone();
         let threads = self.effective_threads();
         let ctx_clone = ctx.clone();
 
@@ -1473,6 +1542,7 @@ impl ArchiverApp {
                         &inputs,
                         &target,
                         format,
+                        password.as_deref(),
                         delete_source_after_extract,
                         threads,
                         Arc::clone(&cancel_flag),
@@ -1492,6 +1562,14 @@ impl ArchiverApp {
                         Err(err) if err.contains(CANCELLED_MARKER) => {
                             let _ = tx.send(WorkerMessage::Cancelled);
                         }
+                        Err(err) if err.contains(BAD_PASSWORD_MARKER) => {
+                            let _ = tx.send(WorkerMessage::PasswordRequired { bad_password: true });
+                        }
+                        Err(err) if err.contains(PASSWORD_REQUIRED_MARKER) => {
+                            let _ = tx.send(WorkerMessage::PasswordRequired {
+                                bad_password: false,
+                            });
+                        }
                         Err(err) => {
                             let _ = tx.send(WorkerMessage::Error(err));
                         }
@@ -1501,6 +1579,7 @@ impl ArchiverApp {
                     let result = run_verify(
                         &inputs,
                         format,
+                        password.as_deref(),
                         threads,
                         Arc::clone(&cancel_flag),
                         tx.clone(),
@@ -1540,6 +1619,14 @@ impl ArchiverApp {
                         Err(err) if err.contains(CANCELLED_MARKER) => {
                             let _ = tx.send(WorkerMessage::Cancelled);
                         }
+                        Err(err) if err.contains(BAD_PASSWORD_MARKER) => {
+                            let _ = tx.send(WorkerMessage::PasswordRequired { bad_password: true });
+                        }
+                        Err(err) if err.contains(PASSWORD_REQUIRED_MARKER) => {
+                            let _ = tx.send(WorkerMessage::PasswordRequired {
+                                bad_password: false,
+                            });
+                        }
                         Err(err) => {
                             let _ = tx.send(WorkerMessage::Error(err));
                         }
@@ -1550,9 +1637,10 @@ impl ArchiverApp {
         });
     }
 
-    fn poll_worker(&mut self, ctx: &egui::Context) {
+ fn poll_worker(&mut self, ctx: &egui::Context) {
         let mut finished = false;
         let mut notify_done = false;
+        let mut prompt_password: Option<Option<String>> = None;
         if let Some(rx) = &self.rx {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
@@ -1582,6 +1670,7 @@ impl ArchiverApp {
                         self.last_task_succeeded = true;
                         self.progress = None;
                         self.eta_secs = None;
+                        self.active_password = None;
                         self.status_text = summary;
                         self.last_result_path = result_path;
                         if verify_report.is_some() {
@@ -1592,6 +1681,7 @@ impl ArchiverApp {
                             if self.inputs.is_empty() {
                                 self.output_name.clear();
                                 self.mode = AppMode::Compress;
+                                self.current_archive_encrypted = false;
                                 if !self.format.can_compress() {
                                     self.format = self.config.default_format;
                                 }
@@ -1600,12 +1690,36 @@ impl ArchiverApp {
                         finished = true;
                         notify_done = true;
                     }
+                    WorkerMessage::PasswordRequired { bad_password } => {
+                        self.is_busy = false;
+                        self.is_error = bad_password;
+                        self.last_task_succeeded = false;
+                        self.progress = None;
+                        self.eta_secs = None;
+                        self.current_archive_encrypted = true;
+                        self.active_password = None;
+                        if bad_password {
+                            self.status_text =
+                                "Неверный пароль — введи пароль заново.".to_string();
+                            prompt_password = Some(Some(
+                                "Неверный пароль. Проверь раскладку и попробуй ещё раз."
+                                    .to_string(),
+                            ));
+                        } else {
+                            self.status_text =
+                                "Архив защищён паролем — введи пароль для продолжения."
+                                    .to_string();
+                            prompt_password = Some(None);
+                        }
+                        finished = true;
+                    }
                     WorkerMessage::Cancelled => {
                         self.is_busy = false;
                         self.is_error = false;
                         self.last_task_succeeded = false;
                         self.progress = None;
                         self.eta_secs = None;
+                        self.active_password = None;
                         self.status_text = "Операция отменена пользователем.".to_string();
                         finished = true;
                     }
@@ -1615,6 +1729,7 @@ impl ArchiverApp {
                         self.last_task_succeeded = false;
                         self.progress = None;
                         self.eta_secs = None;
+                        self.active_password = None;
                         self.status_text = format!("Ошибка: {err}");
                         finished = true;
                     }
@@ -1624,6 +1739,9 @@ impl ArchiverApp {
         if finished {
             self.rx = None;
             self.cancel_flag = None;
+        }
+        if let Some(err_msg) = prompt_password {
+            self.open_password_prompt(err_msg);
         }
         if notify_done && self.config.notify_on_complete {
             win_native::play_done_sound();
@@ -2200,7 +2318,7 @@ impl ArchiverApp {
                     ui.add_space(4.0_f32);
                     ui.label(
                         RichText::new(
-                            "Сжатие: .zip • .7z • .tar.zst • .tar.xz • .tar.br • .tar.gz • .tar.lz4  |  + .tar.bz2 и части .001",
+                            "Сжатие: .zip • .7z • .tar.zst • .tar.xz • .tar.br • .tar.gz • .tar.lz4  |  + пароли (.zip/.7z), .tar.bz2 и части .001",
                         )
                         .size(12.0_f32)
                         .color(p.text_muted),
@@ -2255,22 +2373,31 @@ impl ArchiverApp {
         if !self.inputs.is_empty() {
             card_frame(p).show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    let lock_tag = if self.current_archive_encrypted
+                        && matches!(self.mode, AppMode::Extract | AppMode::Verify)
+                    {
+                        " • под паролем"
+                    } else {
+                        ""
+                    };
                     let mode_badge = match self.mode {
                         AppMode::Compress => format!("Режим: Упаковка ({})", self.inputs.len()),
                         AppMode::Extract if self.inputs.len() > 1 => {
                             format!(
-                                "Режим: Распаковка (многотомный • частей: {})",
+                                "Режим: Распаковка (многотомный • частей: {}{lock_tag})",
                                 self.inputs.len()
                             )
                         }
-                        AppMode::Extract => "Режим: Распаковка (1)".to_string(),
+                        AppMode::Extract => format!("Режим: Распаковка (1{lock_tag})"),
                         AppMode::Verify if self.inputs.len() > 1 => {
                             format!(
-                                "Режим: Проверка целостности (многотомный • частей: {})",
+                                "Режим: Проверка целостности (многотомный • частей: {}{lock_tag})",
                                 self.inputs.len()
                             )
                         }
-                        AppMode::Verify => "Режим: Проверка целостности (1)".to_string(),
+                        AppMode::Verify => {
+                            format!("Режим: Проверка целостности (1{lock_tag})")
+                        }
                     };
                     ui.label(RichText::new(mode_badge).strong().color(p.accent));
 
@@ -2282,6 +2409,8 @@ impl ArchiverApp {
                             self.inputs.clear();
                             self.output_name.clear();
                             self.mode = AppMode::Compress;
+                            self.current_archive_encrypted = false;
+                            self.active_password = None;
                             if !self.format.can_compress() {
                                 self.format = self.config.default_format;
                             }
@@ -2334,6 +2463,8 @@ impl ArchiverApp {
                     if self.inputs.is_empty() {
                         self.output_name.clear();
                         self.mode = AppMode::Compress;
+                        self.current_archive_encrypted = false;
+                        self.active_password = None;
                         if !self.format.can_compress() {
                             self.format = self.config.default_format;
                         }
@@ -2350,10 +2481,8 @@ impl ArchiverApp {
 
             let is_extractable_selection = !self.inputs.is_empty()
                 && ((self.inputs.len() == 1
-                    && inspect_archive_candidate(&self.inputs[0])
-                        .ok()
-                        .flatten()
-                        .is_some())
+                    && (ArchiveFormat::from_path(&self.inputs[0]).is_some()
+                        || parse_volume_path(&self.inputs[0]).is_some()))
                     || all_belong_to_same_split_archive(&self.inputs));
 
             if is_extractable_selection {
@@ -2368,8 +2497,11 @@ impl ArchiverApp {
                         ui.selectable_value(&mut self.mode, AppMode::Compress, "Переупаковать");
                     });
                     if old_mode != self.mode {
-                        if self.mode == AppMode::Compress && !self.format.can_compress() {
-                            self.format = self.config.default_format;
+                        if self.mode == AppMode::Compress {
+                            self.active_password = None;
+                            if !self.format.can_compress() {
+                                self.format = self.config.default_format;
+                            }
                         }
                         self.suggest_output_name();
                     }
@@ -2474,6 +2606,15 @@ impl ArchiverApp {
                     .size(12.0_f32)
                     .color(p.text_muted),
                 );
+                if self.current_archive_encrypted {
+                    ui.label(
+                        RichText::new(
+                            "Архив защищён паролем — при запуске появится окно ввода пароля.",
+                        )
+                        .size(11.5_f32)
+                        .color(p.accent),
+                    );
+                }
             } else {
                 ui.horizontal(|ui| {
                     let name_label = match self.mode {
@@ -2534,6 +2675,16 @@ impl ArchiverApp {
                         )
                         .size(11.5_f32)
                         .color(p.text_muted),
+                    );
+                }
+
+                if self.mode == AppMode::Extract && self.current_archive_encrypted {
+                    ui.label(
+                        RichText::new(
+                            "Архив защищён паролем — при запуске появится окно ввода пароля.",
+                        )
+                        .size(11.5_f32)
+                        .color(p.accent),
                     );
                 }
 
@@ -2675,6 +2826,7 @@ impl ArchiverApp {
         let base_path = pending.base_path.clone();
         let volumes = pending.volumes.clone();
         let archive_fmt = pending.format;
+        let encrypted = pending.encrypted;
         let parts_count = volumes.len();
         let file_name = base_path
             .file_name()
@@ -2686,48 +2838,67 @@ impl ArchiverApp {
             .unwrap_or_else(|| strip_archive_ext(&base_path));
         let show_verify = self.config.verify_integrity_enabled;
 
+        let win_w = modal_fixed_width(ctx, 540.0_f32);
         let mut action: Option<u8> = None;
 
         egui::Window::new("Обнаружен архив")
             .collapsible(false)
             .resizable(false)
+            .movable(false)
+            .min_width(win_w).max_width(win_w)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .max_width(510.0_f32)
             .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(8.0_f32, 10.0_f32);
+                ui.set_width(win_w - 16.0_f32);
+                ui.spacing_mut().item_spacing = Vec2::new(8.0_f32, 9.0_f32);
                 let header = if parts_count > 1 {
                     format!(
                         "Найден многотомный архив ({} • частей: {parts_count}):",
                         archive_fmt.short_label()
                     )
                 } else {
-                    format!(
-                        "Ты добавил готовый архив ({}):",
-                        archive_fmt.short_label()
-                    )
+                    format!("Ты добавил готовый архив ({}):", archive_fmt.short_label())
                 };
                 ui.label(RichText::new(header).color(p.text_muted));
-                ui.label(
-                    RichText::new(&file_name)
-                        .size(15.0_f32)
-                        .strong()
-                        .color(p.text_primary),
-                );
-                ui.label(
-                    RichText::new(format!("Распакуется в: {extract_preview}"))
-                        .size(12.0_f32)
-                        .color(p.text_muted),
-                );
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&file_name)
+                            .size(15.0_f32)
+                            .strong()
+                            .color(p.text_primary),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(&file_name);
+
+                if encrypted {
+                    ui.label(
+                        RichText::new("Архив защищён паролем — при распаковке потребуется пароль")
+                            .size(12.5_f32)
+                            .strong()
+                            .color(p.accent),
+                    );
+                }
+
+                let extract_line = format!("Распакуется в: {extract_preview}");
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&extract_line)
+                            .size(12.0_f32)
+                            .color(p.text_muted),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(&extract_preview);
 
                 ui.add_space(6.0_f32);
-                ui.horizontal_wrapped(|ui| {
+                ui.horizontal(|ui| {
                     let extract_btn = egui::Button::new(
                         RichText::new("Распаковать")
                             .strong()
                             .color(Color32::WHITE),
                     )
                     .fill(p.accent)
-                    .min_size(Vec2::new(124.0_f32, 34.0_f32))
+                    .min_size(Vec2::new(118.0_f32, 34.0_f32))
                     .rounding(Rounding::same(6.0_f32));
 
                     if ui.add(extract_btn).clicked() {
@@ -2738,7 +2909,7 @@ impl ArchiverApp {
                         && ui
                             .add(
                                 egui::Button::new("Проверить")
-                                    .min_size(Vec2::new(105.0_f32, 34.0_f32))
+                                    .min_size(Vec2::new(98.0_f32, 34.0_f32))
                                     .rounding(Rounding::same(6.0_f32)),
                             )
                             .clicked()
@@ -2749,7 +2920,7 @@ impl ArchiverApp {
                     if ui
                         .add(
                             egui::Button::new("Добавить к упаковке")
-                                .min_size(Vec2::new(150.0_f32, 34.0_f32))
+                                .min_size(Vec2::new(156.0_f32, 34.0_f32))
                                 .rounding(Rounding::same(6.0_f32)),
                         )
                         .clicked()
@@ -2773,7 +2944,7 @@ impl ArchiverApp {
         match action {
             Some(1) => {
                 self.pending_archive = None;
-                self.setup_extract_and_start(base_path, volumes, archive_fmt, ctx);
+                self.setup_extract_and_start(base_path, volumes, archive_fmt, encrypted, ctx);
             }
             Some(2) => {
                 self.pending_archive = None;
@@ -2784,9 +2955,127 @@ impl ArchiverApp {
             }
             Some(4) => {
                 self.pending_archive = None;
-                self.setup_verify_and_start(base_path, volumes, archive_fmt, ctx);
+                self.setup_verify_and_start(base_path, volumes, archive_fmt, encrypted, ctx);
             }
             _ => {}
+        }
+    }
+
+    fn render_password_modal(&mut self, ctx: &egui::Context, p: Palette) {
+        if self.password_prompt.is_none() {
+            return;
+        }
+
+        let win_w = modal_fixed_width(ctx, 460.0_f32);
+        let mut submitted_password: Option<String> = None;
+        let mut cancelled = false;
+
+        if let Some(prompt) = self.password_prompt.as_mut() {
+            let action_btn_text = match prompt.target_mode {
+                AppMode::Verify => "Проверить",
+                _ => "Распаковать",
+            };
+
+            egui::Window::new("Архив защищён паролем")
+                .collapsible(false)
+                .resizable(false)
+                .movable(false)
+                .min_width(win_w).max_width(win_w)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.set_width(win_w - 16.0_f32);
+                    ui.spacing_mut().item_spacing = Vec2::new(8.0_f32, 9.0_f32);
+
+                    ui.label(
+                        RichText::new("Введи пароль для доступа к архиву:")
+                            .color(p.text_muted),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&prompt.archive_name)
+                                .size(14.5_f32)
+                                .strong()
+                                .color(p.text_primary),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&prompt.archive_name);
+
+                    let edit_resp = ui.add(
+                        egui::TextEdit::singleline(&mut prompt.password)
+                            .password(!prompt.show_password)
+                            .hint_text("Введи пароль...")
+                            .desired_width(ui.available_width()),
+                    );
+
+                    if prompt.just_opened {
+                        edit_resp.request_focus();
+                        prompt.just_opened = false;
+                    }
+
+                    if edit_resp.changed() {
+                        prompt.error_message = None;
+                    }
+
+                    ui.checkbox(&mut prompt.show_password, "Показывать пароль при вводе");
+
+                    if let Some(err) = &prompt.error_message {
+                        ui.label(RichText::new(err).size(12.5_f32).strong().color(p.error));
+                    }
+
+                    let enter_pressed = edit_resp.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let esc_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
+
+                    let can_submit = !prompt.password.is_empty();
+                    if enter_pressed && can_submit {
+                        submitted_password = Some(prompt.password.clone());
+                    } else if esc_pressed {
+                        cancelled = true;
+                    }
+
+                    ui.add_space(4.0_f32);
+                    ui.horizontal(|ui| {
+                        let ok_btn = egui::Button::new(
+                            RichText::new(action_btn_text)
+                                .strong()
+                                .color(if can_submit {
+                                    Color32::WHITE
+                                } else {
+                                    p.text_muted
+                                }),
+                        )
+                        .fill(if can_submit { p.accent } else { p.btn_bg })
+                        .min_size(Vec2::new(135.0_f32, 34.0_f32))
+                        .rounding(Rounding::same(6.0_f32));
+
+                        if ui.add_enabled(can_submit, ok_btn).clicked() {
+                            submitted_password = Some(prompt.password.clone());
+                        }
+
+                        if ui
+                            .add(
+                                egui::Button::new("Отмена")
+                                    .min_size(Vec2::new(96.0_f32, 34.0_f32))
+                                    .rounding(Rounding::same(6.0_f32)),
+                            )
+                            .clicked()
+                        {
+                            cancelled = true;
+                        }
+                    });
+                });
+        }
+
+        if let Some(pw) = submitted_password {
+            self.password_prompt = None;
+            self.active_password = Some(pw);
+            self.start_task(ctx);
+        } else if cancelled {
+            self.password_prompt = None;
+            self.active_password = None;
+            self.is_error = false;
+            self.status_text = "Ввод пароля отменён.".to_string();
         }
     }
 
@@ -2795,14 +3084,17 @@ impl ArchiverApp {
             return;
         }
 
+        let win_w = modal_fixed_width(ctx, 460.0_f32);
         let mut decision: Option<bool> = None;
 
         egui::Window::new("Подтверждение автоудаления")
             .collapsible(false)
             .resizable(false)
+            .movable(false)
+            .min_width(win_w).max_width(win_w)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .max_width(460.0_f32)
             .show(ctx, |ui| {
+                ui.set_width(win_w - 16.0_f32);
                 ui.spacing_mut().item_spacing = Vec2::new(8.0_f32, 10.0_f32);
                 ui.label(
                     RichText::new("Вы действительно хотите включить автоудаление исходного архива?")
@@ -2867,15 +3159,18 @@ impl ArchiverApp {
             return;
         };
 
+        let win_w = modal_fixed_width(ctx, 460.0_f32);
         let mut close = false;
         let show_explorer_path = self.last_result_path.clone();
 
         egui::Window::new(&report.title)
             .collapsible(false)
             .resizable(false)
+            .movable(false)
+            .min_width(win_w).max_width(win_w)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .max_width(450.0_f32)
             .show(ctx, |ui| {
+                ui.set_width(win_w - 16.0_f32);
                 ui.spacing_mut().item_spacing = Vec2::new(8.0_f32, 9.0_f32);
                 ui.label(
                     RichText::new(&report.headline)
@@ -2889,14 +3184,20 @@ impl ArchiverApp {
                 } else {
                     String::new()
                 };
-                ui.label(
-                    RichText::new(format!(
-                        "Архив: {} ({}{})",
-                        report.archive_name, report.format_label, parts_note
-                    ))
-                    .size(12.5_f32)
-                    .color(p.text_primary),
+                let archive_line = format!(
+                    "Архив: {} ({}{})",
+                    report.archive_name, report.format_label, parts_note
                 );
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&archive_line)
+                            .size(12.5_f32)
+                            .color(p.text_primary),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(&report.archive_name);
+
                 ui.label(
                     RichText::new(format!(
                         "Проверено объектов: {}  •  Объём: {}  •  Время: {:.2} с",
@@ -2952,6 +3253,7 @@ impl eframe::App for ArchiverApp {
 
         let p = Palette::for_theme(self.config.theme);
         let modal_open = self.pending_archive.is_some()
+            || self.password_prompt.is_some()
             || self.confirm_delete_source_modal
             || self.verify_result_modal.is_some();
 
@@ -2984,9 +3286,16 @@ impl eframe::App for ArchiverApp {
             });
 
         self.render_archive_confirm_modal(ctx, p);
+        self.render_password_modal(ctx, p);
         self.render_delete_confirm_modal(ctx, p);
         self.render_verify_result_modal(ctx, p);
     }
+}
+
+fn modal_fixed_width(ctx: &egui::Context, desired: f32) -> f32 {
+    let max_w = (ctx.screen_rect().width() - 40.0_f32).max(320.0_f32);
+    let w = desired.min(max_w);
+    (w / 2.0_f32).floor() * 2.0_f32
 }
 
 fn card_frame(p: Palette) -> Frame {
@@ -3072,12 +3381,22 @@ fn draw_slim_progress_bar(ui: &mut egui::Ui, progress: Option<f32>, p: Palette) 
     }
 }
 
-// ---------- Многотомные архивы (.001, .002, .003...) ----------
+// ==================== КОНЕЦ ЧАСТИ 1 (вставь Часть 2 сразу ниже) ====================
+// ==================== НАЧАЛО ЧАСТИ 2 ====================
+
+// ---------- Многотомные архивы (.001, .002, .003...) и определение шифрования ----------
 
 struct ParsedVolume {
     base_path: PathBuf,
     digits_len: usize,
     format: ArchiveFormat,
+}
+
+struct InspectedArchive {
+    base_path: PathBuf,
+    format: ArchiveFormat,
+    volumes: Vec<PathBuf>,
+    encrypted: bool,
 }
 
 fn parse_volume_path(path: &Path) -> Option<ParsedVolume> {
@@ -3125,9 +3444,81 @@ fn volume_part_path(base_path: &Path, part_num: usize, digits_len: usize) -> Pat
     PathBuf::from(os)
 }
 
-fn inspect_archive_candidate(
-    path: &Path,
-) -> Result<Option<(PathBuf, ArchiveFormat, Vec<PathBuf>)>, String> {
+fn detect_zip_encrypted(volumes: &[PathBuf]) -> bool {
+    let Ok(reader) = MultiVolumeReader::open(volumes) else {
+        return false;
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(reader) else {
+        return false;
+    };
+    let check_limit = archive.len().min(64);
+    for i in 0..check_limit {
+        if let Ok(entry) = archive.by_index_raw(i) {
+            if !entry.is_dir() && entry.encrypted() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn detect_7z_encrypted(volumes: &[PathBuf]) -> bool {
+    let Ok(reader) = MultiVolumeReader::open(volumes) else {
+        return false;
+    };
+    let mut archive = match ArchiveReader::new(reader, Password::empty()) {
+        Ok(a) => a,
+        Err(e) => {
+            let lower = e.to_string().to_ascii_lowercase();
+            return lower.contains("password")
+                || lower.contains("decrypt")
+                || lower.contains("aes")
+                || lower.contains("encrypted");
+        }
+    };
+
+    let mut read_pw_err = false;
+    let res = archive.for_each_entries(|_entry, entry_reader| {
+        let mut buf = [0u8; 1];
+        match entry_reader.read(&mut buf) {
+            Ok(0) => Ok(true),
+            Ok(_) => Ok(false),
+            Err(e) => {
+                let lower = e.to_string().to_ascii_lowercase();
+                if lower.contains("password")
+                    || lower.contains("decrypt")
+                    || lower.contains("aes")
+                    || lower.contains("encrypted")
+                {
+                    read_pw_err = true;
+                }
+                Ok(false)
+            }
+        }
+    });
+
+    if read_pw_err {
+        return true;
+    }
+    if let Err(e) = res {
+        let lower = e.to_string().to_ascii_lowercase();
+        return lower.contains("password")
+            || lower.contains("decrypt")
+            || lower.contains("aes")
+            || lower.contains("encrypted");
+    }
+    false
+}
+
+fn detect_archive_encrypted(volumes: &[PathBuf], format: ArchiveFormat) -> bool {
+    match format {
+        ArchiveFormat::Zip => detect_zip_encrypted(volumes),
+        ArchiveFormat::SevenZ => detect_7z_encrypted(volumes),
+        _ => false,
+    }
+}
+
+fn inspect_archive_candidate(path: &Path) -> Result<Option<InspectedArchive>, String> {
     if !path.is_file() {
         return Ok(None);
     }
@@ -3166,11 +3557,7 @@ fn inspect_archive_candidate(
 
         let max_num = *found.keys().next_back().unwrap_or(&0);
         if max_num == 0 || !found.contains_key(&1) {
-            let missing_name = format!(
-                "{base_name}.{:0width$}",
-                1,
-                width = parsed.digits_len
-            );
+            let missing_name = format!("{base_name}.{:0width$}", 1, width = parsed.digits_len);
             return Err(format!("Не найдена первая часть архива: {missing_name}"));
         }
 
@@ -3179,20 +3566,30 @@ fn inspect_archive_candidate(
             if let Some(p) = found.get(&num) {
                 ordered.push(p.clone());
             } else {
-                let missing_name = format!(
-                    "{base_name}.{:0width$}",
-                    num,
-                    width = parsed.digits_len
-                );
+                let missing_name =
+                    format!("{base_name}.{:0width$}", num, width = parsed.digits_len);
                 return Err(format!("Не хватает части архива: {missing_name}"));
             }
         }
 
-        return Ok(Some((parsed.base_path, parsed.format, ordered)));
+        let encrypted = detect_archive_encrypted(&ordered, parsed.format);
+        return Ok(Some(InspectedArchive {
+            base_path: parsed.base_path,
+            format: parsed.format,
+            volumes: ordered,
+            encrypted,
+        }));
     }
 
     if let Some(fmt) = ArchiveFormat::from_path(path) {
-        return Ok(Some((path.to_path_buf(), fmt, vec![path.to_path_buf()])));
+        let volumes = vec![path.to_path_buf()];
+        let encrypted = detect_archive_encrypted(&volumes, fmt);
+        return Ok(Some(InspectedArchive {
+            base_path: path.to_path_buf(),
+            format: fmt,
+            volumes,
+            encrypted,
+        }));
     }
 
     Ok(None)
@@ -3703,6 +4100,57 @@ impl<W: Write> Write for ParallelGzipWriter<W> {
     }
 }
 
+// ---------- Классификация ошибок паролей ----------
+
+fn map_zip_open_err(err: zip::result::ZipError, has_password: bool) -> String {
+    match err {
+        zip::result::ZipError::InvalidPassword => BAD_PASSWORD_MARKER.to_string(),
+        zip::result::ZipError::UnsupportedArchive(msg)
+            if msg.to_ascii_lowercase().contains("password") =>
+        {
+            if has_password {
+                BAD_PASSWORD_MARKER.to_string()
+            } else {
+                PASSWORD_REQUIRED_MARKER.to_string()
+            }
+        }
+        other => other.to_string(),
+    }
+}
+
+fn classify_7z_error(msg: &str, has_password: bool, on_header: bool) -> String {
+    let lower = msg.to_ascii_lowercase();
+    let explicit_pw = lower.contains("password")
+        || lower.contains("decrypt")
+        || lower.contains("aes")
+        || lower.contains("encrypted");
+
+    if explicit_pw {
+        return if has_password {
+            BAD_PASSWORD_MARKER.to_string()
+        } else {
+            PASSWORD_REQUIRED_MARKER.to_string()
+        };
+    }
+
+    if has_password {
+        let likely_bad_pw = on_header
+            || lower.contains("checksum")
+            || lower.contains("crc")
+            || lower.contains("corrupt")
+            || lower.contains("invalid")
+            || lower.contains("lzma")
+            || lower.contains("eof")
+            || lower.contains("stream")
+            || lower.contains("bad");
+        if likely_bad_pw {
+            return BAD_PASSWORD_MARKER.to_string();
+        }
+    }
+
+    msg.to_string()
+}
+
 // ---------- Логика сжатия, распаковки и проверки целостности ----------
 
 #[allow(clippy::too_many_arguments)]
@@ -3831,13 +4279,15 @@ fn run_compress(
     let verify_report = if verify_after_compress {
         let verify_started = Instant::now();
         let (entries_count, checked_bytes) =
-            run_verify(&produced_volumes, format, threads, cancel, tx, ctx).map_err(|err| {
-                if err.contains(CANCELLED_MARKER) {
-                    err
-                } else {
-                    format!("Автопроверка выявила повреждение архива: {err}")
-                }
-            })?;
+            run_verify(&produced_volumes, format, None, threads, cancel, tx, ctx).map_err(
+                |err| {
+                    if err.contains(CANCELLED_MARKER) {
+                        err
+                    } else {
+                        format!("Автопроверка выявила повреждение архива: {err}")
+                    }
+                },
+            )?;
         let archive_name = output_path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -3865,6 +4315,7 @@ fn run_extract(
     volumes: &[PathBuf],
     extract_dir: &Path,
     format: ArchiveFormat,
+    password: Option<&str>,
     delete_source_after_extract: bool,
     threads: usize,
     cancel: Arc<AtomicBool>,
@@ -3874,8 +4325,10 @@ fn run_extract(
     let pool = build_thread_pool(threads)?;
 
     let res = match format {
-        ArchiveFormat::Zip => extract_zip_parallel(volumes, extract_dir, &pool, cancel, tx, ctx),
-        ArchiveFormat::SevenZ => extract_7z(volumes, extract_dir, cancel, tx, ctx),
+        ArchiveFormat::Zip => {
+            extract_zip_parallel(volumes, extract_dir, password, &pool, cancel, tx, ctx)
+        }
+        ArchiveFormat::SevenZ => extract_7z(volumes, extract_dir, password, cancel, tx, ctx),
         ArchiveFormat::TarZst
         | ArchiveFormat::TarXz
         | ArchiveFormat::TarBr
@@ -3910,7 +4363,13 @@ fn run_extract(
             }
             Ok(summary)
         }
-        Err(err) if err.contains(CANCELLED_MARKER) => Err(err),
+        Err(err)
+            if err.contains(CANCELLED_MARKER)
+                || err.contains(PASSWORD_REQUIRED_MARKER)
+                || err.contains(BAD_PASSWORD_MARKER) =>
+        {
+            Err(err)
+        }
         Err(err) if volumes.len() > 1 => Err(format!(
             "{err} (Проверь, что все части архива .001, .002... скачаны в одну папку)"
         )),
@@ -3921,6 +4380,7 @@ fn run_extract(
 fn run_verify(
     volumes: &[PathBuf],
     format: ArchiveFormat,
+    password: Option<&str>,
     threads: usize,
     cancel: Arc<AtomicBool>,
     tx: Sender<WorkerMessage>,
@@ -3929,8 +4389,8 @@ fn run_verify(
     let pool = build_thread_pool(threads)?;
 
     let res = match format {
-        ArchiveFormat::Zip => verify_zip_parallel(volumes, &pool, cancel, tx, ctx),
-        ArchiveFormat::SevenZ => verify_7z(volumes, cancel, tx, ctx),
+        ArchiveFormat::Zip => verify_zip_parallel(volumes, password, &pool, cancel, tx, ctx),
+        ArchiveFormat::SevenZ => verify_7z(volumes, password, cancel, tx, ctx),
         ArchiveFormat::TarZst
         | ArchiveFormat::TarXz
         | ArchiveFormat::TarBr
@@ -3941,7 +4401,13 @@ fn run_verify(
 
     match res {
         Ok(stats) => Ok(stats),
-        Err(err) if err.contains(CANCELLED_MARKER) => Err(err),
+        Err(err)
+            if err.contains(CANCELLED_MARKER)
+                || err.contains(PASSWORD_REQUIRED_MARKER)
+                || err.contains(BAD_PASSWORD_MARKER) =>
+        {
+            Err(err)
+        }
         Err(err) if volumes.len() > 1 => Err(format!(
             "Нарушена целостность: {err} (Проверь, что все части .001, .002... скачаны полностью)"
         )),
@@ -4408,55 +4874,116 @@ fn compress_tar_lz4(
     Ok(())
 }
 
+fn precheck_zip_password(
+    archive: &mut zip::ZipArchive<MultiVolumeReader>,
+    encrypted_files: &[(usize, u64)],
+    password: Option<&str>,
+) -> Result<(), String> {
+    if encrypted_files.is_empty() {
+        return Ok(());
+    }
+    let Some(pw) = password else {
+        return Err(PASSWORD_REQUIRED_MARKER.to_string());
+    };
+
+    let &(test_idx, test_size) = encrypted_files
+        .iter()
+        .filter(|(_, sz)| *sz > 0)
+        .min_by_key(|(_, sz)| *sz)
+        .unwrap_or(&encrypted_files[0]);
+
+    let mut entry = archive
+        .by_index_decrypt(test_idx, pw.as_bytes())
+        .map_err(|e| map_zip_open_err(e, true))?;
+
+    let check_res = if test_size <= 16 * 1024 * 1024 {
+        io::copy(&mut entry, &mut io::sink())
+    } else {
+        io::copy(&mut entry.take(64 * 1024), &mut io::sink())
+    };
+
+    if check_res.is_err() {
+        return Err(BAD_PASSWORD_MARKER.to_string());
+    }
+
+    Ok(())
+}
+
 fn extract_zip_parallel(
     volumes: &[PathBuf],
     extract_dir: &Path,
+    password: Option<&str>,
     pool: &rayon::ThreadPool,
     cancel: Arc<AtomicBool>,
     tx: Sender<WorkerMessage>,
     ctx: egui::Context,
 ) -> Result<(), String> {
-    fs::create_dir_all(extract_dir).map_err(|e| e.to_string())?;
-
-    let mut file_indices = Vec::new();
+    let mut dirs_to_create: Vec<PathBuf> = Vec::new();
+    let mut file_indices: Vec<(usize, bool)> = Vec::new();
+    let mut encrypted_files: Vec<(usize, u64)> = Vec::new();
     let mut total_bytes: u64 = 0;
+
     {
         let reader = MultiVolumeReader::open(volumes).map_err(|e| e.to_string())?;
         let mut archive = zip::ZipArchive::new(reader).map_err(|e| e.to_string())?;
         for i in 0..archive.len() {
-            let entry = archive.by_index(i).map_err(|e| e.to_string())?;
+            let entry = archive.by_index_raw(i).map_err(|e| e.to_string())?;
             let Some(enclosed) = entry.enclosed_name() else {
                 continue;
             };
             let out_path = extract_dir.join(enclosed);
             if entry.is_dir() {
-                fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
+                dirs_to_create.push(out_path);
             } else {
                 if let Some(parent) = out_path.parent() {
-                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    dirs_to_create.push(parent.to_path_buf());
                 }
-                total_bytes += entry.size();
-                file_indices.push(i);
+                let is_enc = entry.encrypted();
+                let sz = entry.size();
+                if is_enc {
+                    encrypted_files.push((i, sz));
+                }
+                total_bytes += sz;
+                file_indices.push((i, is_enc));
             }
         }
+
+        // Проверяем пароль до создания папки, чтобы не оставлять мусор на диске при опечатке
+        precheck_zip_password(&mut archive, &encrypted_files, password)?;
+    }
+
+    let dir_existed_before = extract_dir.exists();
+    fs::create_dir_all(extract_dir).map_err(|e| e.to_string())?;
+    for d in dirs_to_create {
+        fs::create_dir_all(&d).map_err(|e| e.to_string())?;
     }
 
     let tracker = ProgressTracker::new(total_bytes, cancel, tx, ctx);
     let total_files = file_indices.len().max(1);
     let done_files = Arc::new(AtomicUsize::new(0));
 
-    pool.install(|| {
+    let extract_res: Result<(), String> = pool.install(|| {
         file_indices.par_iter().try_for_each_init(
             || -> Result<zip::ZipArchive<MultiVolumeReader>, String> {
                 let r = MultiVolumeReader::open(volumes).map_err(|e| e.to_string())?;
                 zip::ZipArchive::new(r).map_err(|e| e.to_string())
             },
-            |archive_res, &idx| -> Result<(), String> {
+            |archive_res, &(idx, is_encrypted)| -> Result<(), String> {
                 if tracker.is_cancelled() {
                     return Err(CANCELLED_MARKER.to_string());
                 }
                 let archive = archive_res.as_mut().map_err(|e| e.clone())?;
-                let mut entry = archive.by_index(idx).map_err(|e| e.to_string())?;
+                let mut entry = if is_encrypted {
+                    let pw = password.ok_or_else(|| PASSWORD_REQUIRED_MARKER.to_string())?;
+                    archive
+                        .by_index_decrypt(idx, pw.as_bytes())
+                        .map_err(|e| map_zip_open_err(e, true))?
+                } else {
+                    archive
+                        .by_index(idx)
+                        .map_err(|e| map_zip_open_err(e, false))?
+                };
+
                 let Some(enclosed) = entry.enclosed_name() else {
                     return Ok(());
                 };
@@ -4470,12 +4997,32 @@ fn extract_zip_parallel(
                 let out_file = File::create(&out_path).map_err(|e| e.to_string())?;
                 let buf_sz = adaptive_buffer_size(entry.size());
                 let mut out_writer = BufWriter::with_capacity(buf_sz, out_file);
-                copy_with_progress(&mut entry, &mut out_writer, buf_sz, &tracker)?;
+                if let Err(err) = copy_with_progress(&mut entry, &mut out_writer, buf_sz, &tracker)
+                {
+                    if err.contains(CANCELLED_MARKER) {
+                        return Err(err);
+                    }
+                    if is_encrypted {
+                        return Err(BAD_PASSWORD_MARKER.to_string());
+                    }
+                    return Err(err);
+                }
                 out_writer.flush().map_err(|e| e.to_string())?;
                 Ok(())
             },
         )
-    })?;
+    });
+
+    if let Err(err) = extract_res {
+        if (err.contains(BAD_PASSWORD_MARKER)
+            || err.contains(PASSWORD_REQUIRED_MARKER)
+            || err.contains(CANCELLED_MARKER))
+            && !dir_existed_before
+        {
+            let _ = fs::remove_dir_all(extract_dir);
+        }
+        return Err(err);
+    }
 
     Ok(())
 }
@@ -4483,39 +5030,63 @@ fn extract_zip_parallel(
 fn extract_7z(
     volumes: &[PathBuf],
     extract_dir: &Path,
+    password: Option<&str>,
     cancel: Arc<AtomicBool>,
     tx: Sender<WorkerMessage>,
     ctx: egui::Context,
 ) -> Result<(), String> {
-    fs::create_dir_all(extract_dir).map_err(|e| e.to_string())?;
-    let tracker = ProgressTracker::new(0, cancel, tx, ctx);
+    let has_password = password.is_some();
+    let pw = password.map(Password::from).unwrap_or_else(Password::empty);
+
     let reader = MultiVolumeReader::open(volumes).map_err(|e| e.to_string())?;
+    let mut archive = match ArchiveReader::new(reader, pw) {
+        Ok(a) => a,
+        Err(e) => return Err(classify_7z_error(&e.to_string(), has_password, true)),
+    };
+
+    let dir_existed_before = extract_dir.exists();
+    fs::create_dir_all(extract_dir).map_err(|e| e.to_string())?;
+
+    let tracker = ProgressTracker::new(0, cancel, tx, ctx);
     let mut count = 0usize;
 
-    let res = sevenz_rust2::decompress_with_extract_fn(
-        reader,
-        extract_dir,
-        |entry, entry_reader, dest| {
-            if tracker.is_cancelled() {
-                return Ok(false);
-            }
-            if !is_safe_relative_entry_path(entry.name()) {
-                return Ok(true);
-            }
-            count += 1;
-            tracker.set_label(format!(
-                "Распаковка 7Z (файлов: {count}): {}",
-                entry.name()
-            ));
-            let mut pr = ProgressReader::new(entry_reader, Arc::clone(&tracker));
-            sevenz_rust2::default_entry_extract_fn(entry, &mut pr, dest)
-        },
-    );
+    let res = archive.for_each_entries(|entry, entry_reader| {
+        if tracker.is_cancelled() {
+            return Ok(false);
+        }
+        if !is_safe_relative_entry_path(entry.name()) {
+            return Ok(true);
+        }
+        count += 1;
+        tracker.set_label(format!(
+            "Распаковка 7Z (файлов: {count}): {}",
+            entry.name()
+        ));
+        let dest = extract_dir.join(entry.name());
+        let mut pr = ProgressReader::new(entry_reader, Arc::clone(&tracker));
+        sevenz_rust2::default_entry_extract_fn(entry, &mut pr, &dest)
+    });
 
     if tracker.is_cancelled() {
+        if !dir_existed_before {
+            let _ = fs::remove_dir_all(extract_dir);
+        }
         return Err(CANCELLED_MARKER.to_string());
     }
-    res.map_err(|e| e.to_string())
+
+    match res {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let classified = classify_7z_error(&e.to_string(), has_password, false);
+            if (classified.contains(BAD_PASSWORD_MARKER)
+                || classified.contains(PASSWORD_REQUIRED_MARKER))
+                && !dir_existed_before
+            {
+                let _ = fs::remove_dir_all(extract_dir);
+            }
+            Err(classified)
+        }
+    }
 }
 
 fn extract_tar_stream(
@@ -4594,25 +5165,34 @@ fn unpack_tar_entries<R: Read>(
 
 fn verify_zip_parallel(
     volumes: &[PathBuf],
+    password: Option<&str>,
     pool: &rayon::ThreadPool,
     cancel: Arc<AtomicBool>,
     tx: Sender<WorkerMessage>,
     ctx: egui::Context,
 ) -> Result<(usize, u64), String> {
-    let mut file_indices = Vec::new();
+    let mut file_indices: Vec<(usize, bool)> = Vec::new();
+    let mut encrypted_files: Vec<(usize, u64)> = Vec::new();
     let mut total_bytes: u64 = 0;
     let total_entries: usize;
+
     {
         let reader = MultiVolumeReader::open(volumes).map_err(|e| e.to_string())?;
         let mut archive = zip::ZipArchive::new(reader).map_err(|e| e.to_string())?;
         total_entries = archive.len();
         for i in 0..archive.len() {
-            let entry = archive.by_index(i).map_err(|e| e.to_string())?;
+            let entry = archive.by_index_raw(i).map_err(|e| e.to_string())?;
             if !entry.is_dir() {
-                total_bytes += entry.size();
-                file_indices.push(i);
+                let is_enc = entry.encrypted();
+                let sz = entry.size();
+                if is_enc {
+                    encrypted_files.push((i, sz));
+                }
+                total_bytes += sz;
+                file_indices.push((i, is_enc));
             }
         }
+        precheck_zip_password(&mut archive, &encrypted_files, password)?;
     }
 
     let tracker = ProgressTracker::new(total_bytes, cancel, tx, ctx);
@@ -4625,12 +5205,21 @@ fn verify_zip_parallel(
                 let r = MultiVolumeReader::open(volumes).map_err(|e| e.to_string())?;
                 zip::ZipArchive::new(r).map_err(|e| e.to_string())
             },
-            |archive_res, &idx| -> Result<(), String> {
+            |archive_res, &(idx, is_encrypted)| -> Result<(), String> {
                 if tracker.is_cancelled() {
                     return Err(CANCELLED_MARKER.to_string());
                 }
                 let archive = archive_res.as_mut().map_err(|e| e.clone())?;
-                let mut entry = archive.by_index(idx).map_err(|e| e.to_string())?;
+                let mut entry = if is_encrypted {
+                    let pw = password.ok_or_else(|| PASSWORD_REQUIRED_MARKER.to_string())?;
+                    archive
+                        .by_index_decrypt(idx, pw.as_bytes())
+                        .map_err(|e| map_zip_open_err(e, true))?
+                } else {
+                    archive
+                        .by_index(idx)
+                        .map_err(|e| map_zip_open_err(e, false))?
+                };
                 let completed = done_files.fetch_add(1, Ordering::Relaxed) + 1;
                 tracker.set_label(format!(
                     "Проверка ZIP ({completed}/{total_files}): {}",
@@ -4639,7 +5228,15 @@ fn verify_zip_parallel(
 
                 let buf_sz = adaptive_buffer_size(entry.size());
                 let mut sink = io::sink();
-                copy_with_progress(&mut entry, &mut sink, buf_sz, &tracker)?;
+                if let Err(err) = copy_with_progress(&mut entry, &mut sink, buf_sz, &tracker) {
+                    if err.contains(CANCELLED_MARKER) {
+                        return Err(err);
+                    }
+                    if is_encrypted {
+                        return Err(BAD_PASSWORD_MARKER.to_string());
+                    }
+                    return Err(err);
+                }
                 Ok(())
             },
         )
@@ -4651,44 +5248,48 @@ fn verify_zip_parallel(
 
 fn verify_7z(
     volumes: &[PathBuf],
+    password: Option<&str>,
     cancel: Arc<AtomicBool>,
     tx: Sender<WorkerMessage>,
     ctx: egui::Context,
 ) -> Result<(usize, u64), String> {
-    let tracker = ProgressTracker::new(0, cancel, tx, ctx);
+    let has_password = password.is_some();
+    let pw = password.map(Password::from).unwrap_or_else(Password::empty);
+
     let reader = MultiVolumeReader::open(volumes).map_err(|e| e.to_string())?;
-    let dummy_dir = std::env::temp_dir();
+    let mut archive = match ArchiveReader::new(reader, pw) {
+        Ok(a) => a,
+        Err(e) => return Err(classify_7z_error(&e.to_string(), has_password, true)),
+    };
+
+    let tracker = ProgressTracker::new(0, cancel, tx, ctx);
     let mut count = 0usize;
     let mut read_err: Option<String> = None;
 
-    let res = sevenz_rust2::decompress_with_extract_fn(
-        reader,
-        &dummy_dir,
-        |entry, entry_reader, _dest| {
-            if tracker.is_cancelled() {
-                return Ok(false);
-            }
-            count += 1;
-            tracker.set_label(format!(
-                "Проверка 7Z (объектов: {count}): {}",
-                entry.name()
-            ));
-            let mut pr = ProgressReader::new(entry_reader, Arc::clone(&tracker));
-            if let Err(e) = io::copy(&mut pr, &mut io::sink()) {
-                read_err = Some(e.to_string());
-                return Ok(false);
-            }
-            Ok(true)
-        },
-    );
+    let res = archive.for_each_entries(|entry, entry_reader| {
+        if tracker.is_cancelled() {
+            return Ok(false);
+        }
+        count += 1;
+        tracker.set_label(format!(
+            "Проверка 7Z (объектов: {count}): {}",
+            entry.name()
+        ));
+        let mut pr = ProgressReader::new(entry_reader, Arc::clone(&tracker));
+        if let Err(e) = io::copy(&mut pr, &mut io::sink()) {
+            read_err = Some(e.to_string());
+            return Ok(false);
+        }
+        Ok(true)
+    });
 
     if tracker.is_cancelled() {
         return Err(CANCELLED_MARKER.to_string());
     }
     if let Some(err) = read_err {
-        return Err(err);
+        return Err(classify_7z_error(&err, has_password, false));
     }
-    res.map_err(|e| e.to_string())?;
+    res.map_err(|e| classify_7z_error(&e.to_string(), has_password, false))?;
 
     let checked_bytes = tracker.bytes_done.load(Ordering::Relaxed);
     Ok((count, checked_bytes))
